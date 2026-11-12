@@ -963,6 +963,12 @@ with Docker Compose. They are written from each platform's documentation.
   exception is pictures named inside the guide file (`xmltv.php`): that file
   is passed on as is, so a player that shows guide artwork fetches it
   directly. They are only pictures; no video comes that way.
+- **If a playlist manager sits between your player and the proxy,** the
+  pictures are its business, not the proxy's. A playlist manager hands the
+  player its own list, often with logos from its own picture library and with
+  addresses it saved earlier. The proxy never sees those, so they are fetched
+  directly. Only a player that talks to the proxy itself gets every picture
+  through the VPN.
 - **Your logins are in `.env` in plain text**, and the session memory
   (below) holds them too. Keep the folder private.
 - **A slow provider is still slow.** If a provider's server falls behind, the
