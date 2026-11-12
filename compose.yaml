@@ -1,0 +1,509 @@
+##############################################################################
+# IPTV through a VPN, with nothing to install on your devices
+#
+#   iptv-vpn     gluetun. Holds the VPN tunnel (WireGuard or OpenVPN, any
+#                provider gluetun supports).
+#   iptv-nginx   A reverse proxy in front of your IPTV providers. It lives
+#                inside the tunnel's network, so everything it fetches from a
+#                provider goes out through the VPN and nothing else can.
+#
+# Your players and playlist managers connect to this machine instead of to
+# the provider:
+#        http://<this machine>:<the provider's port>
+#        username / password = PLAYER_USER / PLAYER_PASSWORD from .env
+# and behave as if the provider's own Xtream login had been typed into them.
+#
+# YOU NEVER EDIT THIS FILE. Every setting is in .env (copy .env.example to
+# .env and fill it in). To add a provider, add four lines to .env:
+#        NAME_URL=https://provider.example
+#        NAME_PORT=8095
+#        NAME_USER=...
+#        NAME_PASSWORD=...
+# then bring the stack up again. The iptv-nginx log lists the providers it
+# found at each start, and names any it skipped and why.
+#
+# What the proxy does besides passing bytes on (each part is explained where
+# it sits in the config at the bottom of this file):
+#   1. keeps redirects inside the tunnel
+#   2. refuses to be pointed at this machine or your home network
+#   3. points the pieces of an HLS playlist back at itself
+#   4. keeps ONE provider session per live HLS channel
+#   5. swaps the easy login for the provider's
+#
+# Works with HLS, MPEG-TS, movies, series, catch-up and the guide.
+#
+# FOR YOUR HOME NETWORK ONLY. The proxy ports have no protection of their
+# own. Never forward them from the internet; reach them from outside with
+# your own private network (Tailscale, WireGuard, ...) instead.
+#
+# Good to know:
+#   - Xtream logins only. A provider's ready-made M3U link (get.php) is
+#     refused, because the addresses inside it skip the VPN.
+#   - When a player logs in, the provider's reply includes the provider's own
+#     server address, and the proxy passes that reply on unchanged. A player
+#     that connects to that address instead of the one you typed would skip
+#     the VPN.
+#   - Channel logos and posters are fetched by the player straight from
+#     wherever they are hosted, not through the VPN. Only pictures.
+##############################################################################
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # The VPN tunnel. Anything sharing this container's network has no other way
+  # out, so if the tunnel is down nothing leaks. All of its settings are
+  # gluetun's own, read from .env (see the notes there).
+  # ---------------------------------------------------------------------------
+  vpn:
+    image: qmcgaw/gluetun:latest
+    container_name: iptv-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      # Every provider port, same number inside and out. One range covers all
+      # providers, present and future. The range is PROXY_PORTS in .env: set it
+      # to whatever ports are free on your machine.
+      - "${PROXY_PORTS:-8095-8096}:${PROXY_PORTS:-8095-8096}"
+    # The VPN settings, taken from .env by name. A setting you leave out of
+    # .env is simply not passed on, and gluetun uses its own default. Only a
+    # change to one of these (or to PROXY_PORTS) restarts the tunnel; adding or
+    # changing an IPTV provider does not.
+    environment:
+      - TZ
+      - VPN_SERVICE_PROVIDER
+      - VPN_TYPE
+      - SERVER_COUNTRIES
+      - SERVER_REGIONS
+      - SERVER_CITIES
+      - SERVER_HOSTNAMES
+      - WIREGUARD_PRIVATE_KEY
+      - WIREGUARD_ADDRESSES
+      - WIREGUARD_PRESHARED_KEY
+      - WIREGUARD_PUBLIC_KEY
+      - WIREGUARD_ENDPOINT_IP
+      - WIREGUARD_ENDPOINT_PORT
+      - WIREGUARD_MTU
+      - WIREGUARD_PERSISTENT_KEEPALIVE_INTERVAL
+      - WIREGUARD_IMPLEMENTATION
+      - OPENVPN_USER
+      - OPENVPN_PASSWORD
+      - OPENVPN_PROTOCOL
+      - OPENVPN_CUSTOM_CONFIG
+      - FIREWALL_OUTBOUND_SUBNETS
+      - DNS_UPSTREAM_RESOLVER_TYPE
+      - DNS_UPSTREAM_RESOLVERS
+      - DNS_UPSTREAM_PLAIN_ADDRESSES
+      - BLOCK_MALICIOUS
+      # gluetun's own control page stays inside the container.
+      - HTTP_CONTROL_SERVER_ADDRESS=127.0.0.1:8000
+
+  # ---------------------------------------------------------------------------
+  # nginx. Shares the tunnel's network. Its whole configuration is the text
+  # under "configs:" at the bottom of this file.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: iptv-nginx
+    restart: unless-stopped
+    network_mode: "service:vpn"         # all its traffic goes through the tunnel
+    depends_on:
+      vpn:
+        condition: service_healthy
+        restart: true                   # comes back with the tunnel
+    # The provider lines are read from your settings file. That file is .env;
+    # Portainer saves the one you upload as stack.env. Whichever exists is used.
+    env_file:
+      - path: .env
+        required: false
+      - path: stack.env
+        required: false
+    volumes:
+      # Where the proxy remembers each channel's session. Kept in a small Docker
+      # volume so that when this container is recreated (a provider was added,
+      # an update), channels that are playing carry on with the same session.
+      - hls-memory:/var/cache/nginx/hls
+    configs:
+      - source: proxy
+        target: /etc/nginx/conf.d/default.conf
+      - source: provider-locations
+        target: /etc/nginx/provider-locations.conf
+    # At every start: build one nginx server block per provider found in .env
+    # (any NAME with NAME_URL, NAME_PORT, NAME_USER and NAME_PASSWORD), then
+    # start nginx as usual. A provider with a missing or unusable line is
+    # skipped and named in the log; the others still start.
+    #
+    # Provider logins may contain ANY characters. Each one is percent-encoded
+    # here (letters, digits and - . _ ~ stay as they are; everything else
+    # becomes %XX), which is the form a URL needs, so nginx only ever sees
+    # safe text and the provider receives exactly the login it issued.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        out=/etc/nginx/conf.d/providers.conf
+        : > "$$out"
+        enc() {
+          printf '%s' "$$1" | hexdump -v -e '1/1 "%02x\n"' | while read -r h; do
+            case "$$h" in
+              2d|2e|5f|7e|3[0-9]|4[1-9a-f]|5[0-9a]|6[1-9a-f]|7[0-9a]) printf "\\x$$h" ;;
+              *) printf '%%%s' "$$(echo "$$h" | tr a-f A-F)" ;;
+            esac
+          done
+        }
+        ports="$${PROXY_PORTS:-8095-8096}"; stop=""
+        echo "$$ports" | grep -Eqx '[1-9][0-9]{0,4}(-[1-9][0-9]{0,4})?' || stop="PROXY_PORTS must be one port or a range like 8095-8099 (found: $$ports)"
+        [ -z "$$stop" ] && { echo "$$PLAYER_USER" | grep -Eqx '[A-Za-z0-9_-]+' && echo "$$PLAYER_PASSWORD" | grep -Eqx '[A-Za-z0-9_-]+' || stop="PLAYER_USER and PLAYER_PASSWORD must be letters, digits, - or _ only (they are yours to choose)"; }
+        [ -z "$$stop" ] && case "$$PLAYER_USER" in live|movie|series|timeshift) stop="PLAYER_USER cannot be live, movie, series or timeshift";; esac
+        lo=$${ports%-*}; hi=$${ports#*-}; used=" "
+        [ -n "$$stop" ] && echo "PROXY SETTINGS PROBLEM: $$stop"
+        env | sed -n 's/^\([A-Za-z0-9_]*[a-z][A-Za-z0-9_]*\)_URL=.*/\1/p' | while read -r low; do echo "PROVIDER $$low SKIPPED: the name must be in CAPITALS"; done
+        [ -z "$$stop" ] && for name in $$(env | sed -n 's/^\([A-Z][A-Z0-9_]*\)_URL=.*/\1/p' | sort); do
+          url=$$(printenv "$${name}_URL"); port=$$(printenv "$${name}_PORT")
+          user=$$(printenv "$${name}_USER"); pass=$$(printenv "$${name}_PASSWORD")
+          bad=""
+          case "$$name" in PROXY|PLAYER|VPN|OPENVPN|WIREGUARD|SERVER|FIREWALL|DNS) bad="$$name is one of the proxy's own names; pick another";; esac
+          [ -z "$$bad" ] && { [ -n "$$url" ] && [ -n "$$port" ] && [ -n "$$user" ] && [ -n "$$pass" ] || bad="needs $${name}_URL, _PORT, _USER and _PASSWORD"; }
+          [ -z "$$bad" ] && { echo "$$port" | grep -Eqx '[1-9][0-9]{0,4}' && [ "$$port" -le 65535 ] || bad="port must be a number from 1 to 65535"; }
+          [ -z "$$bad" ] && { echo "$$url" | grep -Eqx 'https?://[A-Za-z0-9._-]+(:[0-9]{1,5})?/?' || bad="address must be http://name or https://name, optionally :port, with nothing after it"; }
+          [ -z "$$bad" ] && case " 53 8000 8195 9999 " in *" $$port "*) bad="port $$port is used inside the VPN container itself";; esac
+          [ -z "$$bad" ] && case "$$used" in *" $$port "*) bad="port $$port is already used by another provider";; esac
+          [ -z "$$bad" ] && { [ "$$port" -ge "$$lo" ] && [ "$$port" -le "$$hi" ] || bad="port $$port is outside PROXY_PORTS ($$ports)"; }
+          if [ -n "$$bad" ]; then echo "PROVIDER $$name SKIPPED: $$bad"; continue; fi
+          used="$$used$$port "
+          printf 'server {\n  listen %s;\n  set $$provider  %s;\n  set $$pscheme   %s;\n  set $$acct_user "%s";\n  set $$acct_pass "%s";\n  include /etc/nginx/provider-locations.conf;\n}\n' \
+            "$$port" "$${url%/}" "$${url%%://*}" "$$(enc "$$user")" "$$(enc "$$pass")" >> "$$out"
+          echo "PROVIDER $$name on port $$port -> $${url%/}"
+        done
+        [ "$$used" = " " ] && echo "NO PROVIDERS STARTED. nginx is running with none: fix .env and bring the stack up again."
+        # nginx itself needs none of the settings (they are in the file written
+        # above), so it starts without them.
+        exec env -i PATH="$$PATH" TZ="$${TZ:-UTC}" /docker-entrypoint.sh nginx -g 'daemon off;'
+
+    # Healthy = nginx is still inside the tunnel container's network AND it
+    # answers. If the tunnel container was restarted underneath nginx, nginx is
+    # left in a dead network with no address of its own; then the check
+    # waits a moment for the tunnel container to be back and stops nginx, so
+    # Docker starts it again inside the tunnel's new network.
+    healthcheck:
+      test: ["CMD-SHELL", "ip -o addr show scope global | grep -q . || { sleep 12; kill 1; exit 1; }; wget -q -T 5 -O /dev/null http://127.0.0.1:8195/healthz || exit 1"]
+      interval: 30s
+      timeout: 20s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  hls-memory:
+
+configs:
+  proxy:
+    content: |
+      # Names are looked up through the tunnel container's own DNS.
+      resolver 127.0.0.1 ipv6=off valid=60s;
+      resolver_timeout 5s;
+
+      # ---- Logging. Xtream addresses contain the login, so the address is never logged.
+      map $$uri $$kind {
+        default                              api;
+        ~^/__cdn/.*\.m3u8$$                   cdn-playlist;
+        ~^/__cdn/                            cdn-media;
+        ~^/__ch/.*\.m3u8$$                    hls;
+        ~^/__ch/                             hls-media;
+        ~\.m3u8$$                             hls-open;
+        ~^/(live|movie|series|timeshift)/    media;
+        /xmltv.php                           guide;
+      }
+      log_format masked '$$remote_addr [$$time_local] $$server_port $$status $$body_bytes_sent $$request_time done=$$request_completion up=$$upstream_status up_bytes=$$upstream_bytes_received up_time=$$upstream_response_time m=$$request_method rng="$$http_range" ua="$$http_user_agent" k=$$kind s=$$sess uh=$$proxy_host';
+      error_log /dev/stderr crit;                # upstream error lines would print the address, login included
+
+      # ---- Plain reverse-proxy settings, the same for everything.
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_set_header Accept-Encoding "";      # plain text, so HLS playlists can be read (see sub_filter)
+      proxy_set_header X-Hls-Provider "";       # internal notes of the session memory; never accepted from a player
+      proxy_set_header X-Hls-Renew "";
+      proxy_ssl_server_name on;
+      # Certificates are not checked (nginx's default). Many players do not check
+      # them either, and some providers' servers have expired or self-made ones;
+      # checking here would refuse servers that play fine without the proxy.
+      proxy_buffering off;                      # pass bytes on as they arrive
+      proxy_request_buffering off;
+      proxy_max_temp_file_size 0;
+      proxy_buffer_size 64k;
+      proxy_buffers 8 64k;
+      chunked_transfer_encoding off;            # end streams by closing, like the provider does
+      proxy_connect_timeout 10s;
+      proxy_read_timeout 60s;                   # longest gap between bytes, not stream length
+      send_timeout 60s;
+
+      # ---- 1. Redirects (MPEG-TS, movies, series, catch-up, the guide). A provider
+      # ---- answers "go to that other server". Rewrite the address so the player
+      # ---- comes back to this proxy for it: /__cdn/<scheme>/<host>/...
+      absolute_redirect off;                    # hand the player "/__cdn/..." as is, never "http://this-host/__cdn/..."
+      proxy_redirect ~*^(https?)://([^/]+)(/.*)?$$ /__cdn/$$1/$$2$$3;
+      proxy_redirect ~^//([^/]+)(/.*)?$$ /__cdn/$$pscheme/$$1$$2;   # "//server/path": same http or https as the provider
+
+      # ---- 2. Where a /__cdn/ request really goes, and what it may not reach.
+      map $$request_uri $$cdn_target {
+        default "";
+        ~*^/__cdn/(?<cs>https?)/(?<ch>[^/?]+)(?<cr>/.*)$$  $$cs://$$ch$$cr;
+        ~*^/__cdn/(?<cs>https?)/(?<ch>[^/?]+)$$            $$cs://$$ch/;
+      }
+      map $$request_uri $$cdn_prefix {
+        default "";
+        ~*^(?<cp>/__cdn/https?/[^/?]+)  $$cp;
+      }
+      map $$request_uri $$cdn_scheme {
+        default http;
+        ~*^/__cdn/https/  https;
+      }
+      map $$request_uri $$cdn_forbidden {         # nothing on this machine or this network
+        default 0;
+        "~*^/__cdn/https?/(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|\[|[^/]*[@%])"  1;
+      }
+
+      # ---- 3. HLS playlists name their video pieces without a server (or with the
+      # ---- other server's full address). Point those lines back at this proxy too.
+      sub_filter_types application/vnd.apple.mpegurl application/x-mpegurl application/mpegurl audio/mpegurl audio/x-mpegurl;
+      sub_filter_once off;
+      sub_filter "\n/"            "\n$$cdn/";
+      sub_filter 'URI="/'         'URI="$$cdn/';
+      sub_filter "\nhttps://"     "\n/__cdn/https/";
+      sub_filter "\nhttp://"      "\n/__cdn/http/";
+      sub_filter 'URI="https://'  'URI="/__cdn/https/';
+      sub_filter 'URI="http://'   'URI="/__cdn/http/';
+
+      # ---- 4. Live HLS: one provider session per channel.
+      # ---- Many providers start a NEW session every time a channel's address is
+      # ---- asked, and a new session ends the one before it. A player refreshes
+      # ---- that address every few seconds, and several players or a recording may
+      # ---- be on the same channel. So the proxy remembers where the provider sent
+      # ---- a channel and keeps everyone on that session: the pieces keep the same
+      # ---- addresses from one refresh to the next, and nobody ends anyone else's
+      # ---- stream. When the remembered session is gone, it is replaced once.
+      proxy_cache_path /var/cache/nginx/hls levels=1 keys_zone=hls:1m max_size=16m inactive=1m use_temp_path=off;
+
+      server {                                  # the memory itself; reachable only from this container
+        listen 127.0.0.1:8195;
+        access_log off;
+        location = /healthz { return 200; }     # the container's health check
+        location / {
+          set $$cdn "";
+          set $$sess "-";                       # (these three keep the config valid when no provider is set up)
+          set $$pscheme http;
+          proxy_redirect off;
+          proxy_buffering on;                   # needed to remember an answer; this one is only a redirect
+          proxy_cache hls;
+          proxy_cache_key "$$http_x_hls_provider$$uri";   # the channel address; a query string never names another channel
+          proxy_cache_valid 301 302 303 307 308 365d;  # only the "it is over there" answer is remembered, for as long as the channel is in use
+          proxy_cache_lock on;                  # opens arriving together wait for the first one
+          proxy_cache_lock_timeout 5s;
+          proxy_cache_bypass $$http_x_hls_renew; # asked to replace a session that is gone
+          proxy_ignore_headers Cache-Control Expires Set-Cookie Vary X-Accel-Expires;
+          add_header X-Hls-Sess $$upstream_cache_status always;
+          proxy_pass $$http_x_hls_provider;
+        }
+      }
+
+      # ---- PROVIDERS: one server block per provider is built at start from
+      # ---- .env (see "entrypoint" above) and shares provider-locations below.
+
+  # Shared by every provider block (one per provider in .env).
+  provider-locations:
+    content: |
+      access_log /dev/stdout masked;
+      set $$sess   "-";
+      set $$cdn    "";
+      set $$chmode "";
+      set $$pbase  "";
+
+      # ---- The address the player asked for. Normally that is the request
+      # ---- itself. A live HLS channel is handed its own folder, /__ch/<the
+      # ---- channel's address>/ (see part 4), so there the channel's address is
+      # ---- taken back out of the request.
+      set $$orig $$request_uri;
+      if ($$request_uri ~ "^(?<rp>[^?]*)(?<rq>\?.*)?$$") { set $$chmode ""; }
+      if ($$request_uri ~ "^/__ch(?<co>/.*?\.m3u8)/(?<cn>[^?]*)(?<cq>\?.*)?$$") { set $$orig $$co; set $$chmode piece; }
+      if ($$request_uri ~ "^/__ch(?<cop>/.*?\.m3u8)/__index\.m3u8(?<cqp>\?.*)?$$") { set $$orig "$$cop$$cqp"; set $$chmode playlist; }
+
+      # ---- 5. One easy login for everything behind this proxy. A request that
+      # ---- logs in as PLAYER_USER is sent on with the provider account of its
+      # ---- port; any other login is passed on untouched (and refused by the provider).
+      # ---- $$up_uri is the address sent to the provider: the player's own address,
+      # ---- byte for byte, with only the login swapped. $$acct_user / $$acct_pass are
+      # ---- already percent-encoded (see "entrypoint"), so any character is safe.
+      set $$up_uri $$orig;
+      # (named pieces, not $$1 $$2: nginx re-encodes numbered ones when the address contains %XX)
+      if ($$orig ~ "^/+(?<pa>live|movie|series|timeshift)/+${PLAYER_USER}/+${PLAYER_PASSWORD}/+(?<pb>.*)$$") { set $$up_uri "/$$pa/$$acct_user/$$acct_pass/$$pb"; }
+      if ($$orig ~ "^/+${PLAYER_USER}/+${PLAYER_PASSWORD}/+(?<pc>[^/?]+(\?.*)?)$$") { set $$up_uri "/$$acct_user/$$acct_pass/$$pc"; }
+      if ($$up_uri ~ "^(?<qa>[^?]*\?(.*&)?)username=${PLAYER_USER}(?<qb>(&.*)?)$$") { set $$up_uri "$${qa}username=$$acct_user$$qb"; }
+      if ($$up_uri ~ "^(?<qc>[^?]*\?(.*&)?)password=${PLAYER_PASSWORD}(?<qd>(&.*)?)$$") { set $$up_uri "$${qc}password=$$acct_pass$$qd"; }
+
+      location = /healthz { access_log off; return 200; }
+      location / { proxy_pass $$provider$$up_uri; }
+
+      # The guide and the API are text, often large. Let the provider compress
+      # them if the app asks (as it would directly), and keep the framing that
+      # lets the app notice a download that was cut short.
+      location = /xmltv.php {
+        proxy_read_timeout 300s;
+        chunked_transfer_encoding on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding $$http_accept_encoding;
+        proxy_set_header X-Hls-Provider "";
+        proxy_set_header X-Hls-Renew "";
+        proxy_pass $$provider$$up_uri;
+      }
+      location = /player_api.php {
+        proxy_read_timeout 300s;
+        chunked_transfer_encoding on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding $$http_accept_encoding;
+        proxy_set_header X-Hls-Provider "";
+        proxy_set_header X-Hls-Renew "";
+        proxy_pass $$provider$$up_uri;
+      }
+
+      # A provider's ready-made M3U playlist lists every stream at the
+      # provider's own address with the real login, so a player using it would
+      # skip the VPN. Refused on purpose: use the Xtream login instead.
+      location = /get.php { return 403; }
+
+      # (Order matters below: nginx tries these patterns from top to bottom, so the
+      # two for a channel's own folder come before the general ".m3u8" one.)
+
+      # ---- Live HLS, the channel's playlist (the player arrives here from "the start", further down). Fetch the remembered
+      # ---- session's playlist. The player always asks the same address and always
+      # ---- gets the same session.
+      location ~ ^/__ch/.+\.m3u8/__index\.m3u8$$ {
+        if ($$chmode != playlist) { return 404; }
+        sub_filter_types *;
+        proxy_redirect off;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header X-Hls-Provider $$provider;
+        proxy_set_header X-Hls-Renew "";
+        error_page 301 302 303 307 308 = @hls;
+        proxy_pass http://127.0.0.1:8195$$up_uri;
+      }
+      location @hls {
+        sub_filter_types *;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        proxy_read_timeout 25s;               # long enough for a channel that is slow to start, short enough to replace one that hangs
+        set $$sess $$upstream_http_x_hls_sess;
+        set $$next $$upstream_http_location;
+        if ($$next ~ "^//") { set $$next "$$pscheme:$$next"; }        # "//server/path"
+        if ($$next ~ "^/[^/]") { set $$next "$$provider$$next"; }     # "/some/path" with no server name
+        if ($$next ~* "^https?://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|\[|[^/]*[@%])") { return 403; }
+        if ($$next ~* "^(https?)://([^/]+)") { set $$cdn "/__cdn/$$1/$$2"; }
+        error_page 400 401 403 404 410 429 500 502 503 504 509 520 521 522 523 524 = @hls_renew;   # the remembered session is gone
+        proxy_pass $$next;
+      }
+      location @hls_renew {                   # open the channel again, once, and remember the new session
+        proxy_redirect off;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header X-Hls-Provider $$provider;
+        proxy_set_header X-Hls-Renew 1;
+        error_page 301 302 303 307 308 = @hls_renewed;
+        proxy_pass http://127.0.0.1:8195$$up_uri;
+      }
+      location @hls_renewed {                 # whatever this one answers goes to the player
+        sub_filter_types *;
+        proxy_read_timeout 25s;
+        set $$sess $$upstream_http_x_hls_sess;
+        set $$next $$upstream_http_location;
+        if ($$next ~ "^//") { set $$next "$$pscheme:$$next"; }
+        if ($$next ~ "^/[^/]") { set $$next "$$provider$$next"; }
+        if ($$next ~* "^https?://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|\[|[^/]*[@%])") { return 403; }
+        if ($$next ~* "^(https?)://([^/]+)") { set $$cdn "/__cdn/$$1/$$2"; }
+        proxy_pass $$next;
+      }
+
+      # ---- Live HLS, the pieces: anything else asked inside a channel's folder is a
+      # ---- piece (or a further playlist) that the channel's playlist named with
+      # ---- no server and no folder. It lives next to that playlist, so fetch it
+      # ---- from the folder the channel's session is in.
+      location ~ ^/__ch/ {
+        if ($$chmode != piece) { return 404; }
+        limit_except GET HEAD { deny all; }
+        proxy_redirect off;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header X-Hls-Provider $$provider;
+        proxy_set_header X-Hls-Renew "";
+        error_page 301 302 303 307 308 = @hls_piece;
+        proxy_pass http://127.0.0.1:8195$$up_uri;
+      }
+      location @hls_piece {
+        set $$sess $$upstream_http_x_hls_sess;
+        set $$next $$upstream_http_location;
+        if ($$next ~ "^//") { set $$next "$$pscheme:$$next"; }
+        if ($$next ~ "^/[^/]") { set $$next "$$provider$$next"; }
+        if ($$next ~* "^https?://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|\[|[^/]*[@%])") { return 403; }
+        set $$pdir "/";
+        if ($$next ~* "^https?://[^/?]+(?<nd>/[^?]*/)") { set $$pdir $$nd; }
+        if ($$next ~* "^(?<ns>https?)://(?<nh>[^/?]+)") { set $$cdn "/__cdn/$$ns/$$nh"; set $$pbase "$$ns://$$nh"; }
+        if ($$pbase = "") { return 502; }
+        proxy_redirect ~*^(https?)://([^/]+)(/.*)?$$ /__cdn/$$1/$$2$$3;
+        proxy_redirect ~^//([^/]+)(/.*)?$$ /__cdn/$$ns/$$1$$2;
+        proxy_redirect ~^(/[^/].*)$$ $$cdn$$1;
+        proxy_pass $$pbase$$pdir$$cn$$cq;
+      }
+
+      # ---- Live HLS, the start: the channel is opened. Ask the memory where this
+      # ---- channel's session is. If the provider sends the channel to another
+      # ---- server (most do), give the channel a folder of its own on this proxy
+      # ---- and send the player there. A playlist may name its pieces with no
+      # ---- folder at all ("chunk_123.ts"); the player then asks for them inside
+      # ---- that same folder, and "the pieces" above knows which channel they belong to.
+      # ---- If the provider answers with the playlist itself, it is passed on as is.
+      location ~ \.m3u8$$ {
+        sub_filter_types *;                   # a playlist is rewritten whatever type the provider labels it
+        proxy_redirect off;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header X-Hls-Provider $$provider;
+        proxy_set_header X-Hls-Renew "";
+        error_page 301 302 303 307 308 = @hls_open;
+        proxy_pass http://127.0.0.1:8195$$up_uri;
+      }
+      location @hls_open {
+        set $$sess $$upstream_http_x_hls_sess;
+        return 302 /__ch$$rp/__index.m3u8$$rq;
+      }
+
+      # Everything a provider pointed at: video pieces, MPEG-TS, movies, the guide.
+      location ^~ /__cdn/ {
+        set $$cdn $$cdn_prefix;
+        set $$cdn_s $$cdn_scheme;
+        if ($$cdn_forbidden) { return 403; }
+        if ($$cdn_target = "") { return 404; }
+        limit_except GET HEAD { deny all; }   # players only ever fetch
+        proxy_redirect ~*^(https?)://([^/]+)(/.*)?$$ /__cdn/$$1/$$2$$3;
+        proxy_redirect ~^//([^/]+)(/.*)?$$ /__cdn/$$cdn_s/$$1$$2;
+        proxy_redirect ~^(/[^/].*)$$ $$cdn$$1;   # "go to /some/path" on the same server
+        proxy_pass $$cdn_target;
+
+        # A playlist fetched from the other server: rewritten whatever type it is labelled.
+        location ~ \.m3u8$$ {
+          sub_filter_types *;
+          set $$cdn $$cdn_prefix;
+          set $$cdn_s $$cdn_scheme;
+          if ($$cdn_forbidden) { return 403; }
+          if ($$cdn_target = "") { return 404; }
+          limit_except GET HEAD { deny all; }
+          proxy_pass $$cdn_target;
+        }
+      }

@@ -1,0 +1,5 @@
+# your real settings and logins never belong in git
+.env
+stack.env
+compose.override.yaml
+*.ovpn
