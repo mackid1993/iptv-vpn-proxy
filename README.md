@@ -937,8 +937,16 @@ with Docker Compose. They are written from each platform's documentation.
   includes the provider's own server address. The proxy passes that reply on
   unchanged. A player that connected to that address, instead of the proxy
   address you typed in, would reach the provider directly and skip the VPN.
-- **Channel logos and posters** are fetched by the player straight from
-  wherever they are hosted, not through the VPN. They are only pictures.
+- **Channel logos and posters do not go through the VPN.** The player fetches
+  them straight from wherever they are hosted. The reason: a provider's
+  channel and movie lists give each picture as a full web address, usually on
+  some other site (a picture host, a movie database), not on the provider's
+  own server. The proxy passes those lists on exactly as the provider sent
+  them, so the player goes to those addresses itself. Sending them through
+  the VPN would mean rewriting every list the provider sends, which is the
+  opposite of behaving like a direct connection. This is the same with the
+  provider's login typed straight into a player. They are only pictures; no
+  video comes that way.
 - **Your logins are in `.env` in plain text**, and the session memory
   (below) holds them too. Keep the folder private.
 - **A slow provider is still slow.** If a provider's server falls behind, the
