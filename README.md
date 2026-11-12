@@ -26,6 +26,7 @@ Use it only with services you are entitled to use.
 - [Set it up](#set-it-up)
 - [The two files](#the-two-files)
 - [Everyday use](#everyday-use)
+- [With a playlist manager](#with-a-playlist-manager)
 - [How it works](#how-it-works)
 - [What was tested, and how](#what-was-tested-and-how)
 - [Trade-offs and things to know](#trade-offs-and-things-to-know)
@@ -886,6 +887,51 @@ and run `docker compose up -d`. This one restarts the VPN too.
 
 **See what is happening.** `docker logs iptv-nginx` has one line per request.
 Addresses are never logged, because they contain logins.
+
+## With a playlist manager
+
+A playlist manager is the tool some people use to trim, rename and reorder
+what a provider offers. The proxy works with one, and where the proxy goes
+depends on where the manager runs.
+
+**A manager you run yourself, on your own network**
+
+```
+player  ->  playlist manager  ->  proxy  ->  provider
+```
+
+- In the manager, each provider source uses the proxy's address and port,
+  with your easy login.
+- Your players point at the manager, as they would without the proxy.
+- The provider's real login lives only in the proxy's `.env`.
+
+**A hosted manager, running on someone else's servers**
+
+```
+player  ->  proxy  ->  playlist manager  ->  provider
+```
+
+A hosted manager cannot reach a proxy inside your house, so the proxy goes in
+front of it and treats the manager as the provider.
+
+- In `.env`, add the manager as a provider: its server address as the URL,
+  and your login for the manager as the username and password.
+- Your players point at the proxy, with your easy login.
+- When something is played, the manager answers "go to the provider's
+  server". The proxy rewrites that answer as it does any redirect, so the
+  video goes out through the VPN.
+- The hosted manager itself holds your provider's real login and fetches the
+  provider's lists from its own servers. That part does not go through your
+  VPN; only what your players fetch does.
+
+The first arrangement is the one this was built and tested with. The second
+is the same mechanism but has not been run on this version. In particular,
+live HLS through a hosted manager adds one more redirect on the way to the
+video, and whether a channel's session is still shared across it has not been
+tested.
+
+In either arrangement, see the note on pictures under
+[Trade-offs and things to know](#trade-offs-and-things-to-know).
 
 ## How it works
 
