@@ -33,6 +33,7 @@ Use it only with services you are entitled to use.
 - [Extras that need one more file](#extras-that-need-one-more-file)
 - [Platform notes](#platform-notes)
 - [When something is wrong](#when-something-is-wrong)
+- [Support](#support)
 - [License](#license)
 
 ## Design goals
@@ -926,9 +927,6 @@ service:
 **Not run:** the [platform notes](#platform-notes) other than plain Linux
 with Docker Compose. They are written from each platform's documentation.
 
-If you find a difference from a direct connection, please open an issue with
-what the player did and the matching lines from `docker logs iptv-nginx`.
-
 ## Trade-offs and things to know
 
 - **Xtream logins only.** A provider's ready-made M3U link (`get.php`) is
@@ -1042,6 +1040,13 @@ same everywhere; what differs is where they live and how you start them.
 - **Reading the log.** `k=` is the kind of request. `s=` shows whether a
   channel's session was reused (`HIT`), opened (`MISS`) or replaced
   (`BYPASS`).
+
+## Support
+
+There is none. This was made for personal use and is shared as is, free, in
+case it is useful to someone else. Issues and pull requests are turned off,
+and questions will not be answered. Everything needed to use it is on this
+page. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
