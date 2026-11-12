@@ -375,8 +375,9 @@ nginx configuration, with a comment on each part saying what it is for.
 #     server address, and the proxy passes that reply on unchanged. A player
 #     that connects to that address instead of the one you typed would skip
 #     the VPN.
-#   - Channel logos and posters are fetched by the player straight from
-#     wherever they are hosted, not through the VPN. Only pictures.
+#   - Logos and posters named in the provider's lists are pointed back at
+#     the proxy, so they come through the VPN too. Pictures named inside the
+#     guide file are not; the player fetches those directly.
 ##############################################################################
 
 services:
@@ -688,13 +689,28 @@ configs:
         proxy_set_header X-Hls-Renew "";
         proxy_pass $$provider$$up_uri;
       }
+      # The provider's lists (channels, movies, series). They give logos and
+      # posters as full addresses, usually on other sites. Those addresses are
+      # pointed back at this proxy, so the player fetches the pictures through
+      # the VPN too. For that the list has to arrive as plain text; it is
+      # compressed again for the app if the app asks.
       location = /player_api.php {
         proxy_read_timeout 300s;
         chunked_transfer_encoding on;
         proxy_set_header Connection "";
-        proxy_set_header Accept-Encoding $$http_accept_encoding;
+        proxy_set_header Accept-Encoding "";
         proxy_set_header X-Hls-Provider "";
         proxy_set_header X-Hls-Renew "";
+        gzip on;
+        gzip_types application/json text/plain;
+        gzip_proxied any;
+        gzip_min_length 1024;
+        sub_filter_types *;
+        sub_filter_once off;
+        sub_filter '"https:\/\/' '"http://$$http_host/__cdn/https/';
+        sub_filter '"http:\/\/'  '"http://$$http_host/__cdn/http/';
+        sub_filter '"https://'   '"http://$$http_host/__cdn/https/';
+        sub_filter '"http://'    '"http://$$http_host/__cdn/http/';
         proxy_pass $$provider$$up_uri;
       }
 
@@ -880,8 +896,10 @@ and each one exists to keep the behavior the same as a direct connection:
    "go to that other server". The proxy rewrites that answer so the player
    comes back to the proxy, which then fetches from the other server through
    the VPN. Without this the player would go to that server directly.
-2. **Playlists are pointed back at the proxy.** An HLS playlist is a list of
-   video pieces. The proxy rewrites the addresses in it for the same reason.
+2. **Playlists and picture addresses are pointed back at the proxy.** An HLS
+   playlist is a list of video pieces, and a provider's channel lists name a
+   logo or poster for each entry. The proxy rewrites those addresses for the
+   same reason.
 3. **One session per live channel.** Described [above](#why-this-exists). When
    the provider ends a session, the proxy opens a new one once and carries on.
 4. **One easy login.** You choose a simple username and password for your
@@ -910,6 +928,7 @@ here is which is which.
 - Scheduled recordings
 - A session ended by the provider being replaced without a failed request
 - Restarting the proxy while a channel is playing
+- Logos and posters loading through the proxy
 
 **Confirmed against simulated providers only.** These are behaviors a provider
 could have that the real ones used for testing did not, so a stand-in was
@@ -937,16 +956,13 @@ with Docker Compose. They are written from each platform's documentation.
   includes the provider's own server address. The proxy passes that reply on
   unchanged. A player that connected to that address, instead of the proxy
   address you typed in, would reach the provider directly and skip the VPN.
-- **Channel logos and posters do not go through the VPN.** The player fetches
-  them straight from wherever they are hosted. The reason: a provider's
-  channel and movie lists give each picture as a full web address, usually on
-  some other site (a picture host, a movie database), not on the provider's
-  own server. The proxy passes those lists on exactly as the provider sent
-  them, so the player goes to those addresses itself. Sending them through
-  the VPN would mean rewriting every list the provider sends, which is the
-  opposite of behaving like a direct connection. This is the same with the
-  provider's login typed straight into a player. They are only pictures; no
-  video comes that way.
+- **Logos and posters go through the VPN too, with one exception.** A
+  provider's channel and movie lists give each picture as a full web address,
+  usually on some other site. The proxy points those addresses back at
+  itself, so the player fetches the pictures through the tunnel. The
+  exception is pictures named inside the guide file (`xmltv.php`): that file
+  is passed on as is, so a player that shows guide artwork fetches it
+  directly. They are only pictures; no video comes that way.
 - **Your logins are in `.env` in plain text**, and the session memory
   (below) holds them too. Keep the folder private.
 - **A slow provider is still slow.** If a provider's server falls behind, the

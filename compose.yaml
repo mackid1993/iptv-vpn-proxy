@@ -43,8 +43,9 @@
 #     server address, and the proxy passes that reply on unchanged. A player
 #     that connects to that address instead of the one you typed would skip
 #     the VPN.
-#   - Channel logos and posters are fetched by the player straight from
-#     wherever they are hosted, not through the VPN. Only pictures.
+#   - Logos and posters named in the provider's lists are pointed back at
+#     the proxy, so they come through the VPN too. Pictures named inside the
+#     guide file are not; the player fetches those directly.
 ##############################################################################
 
 services:
@@ -356,13 +357,28 @@ configs:
         proxy_set_header X-Hls-Renew "";
         proxy_pass $$provider$$up_uri;
       }
+      # The provider's lists (channels, movies, series). They give logos and
+      # posters as full addresses, usually on other sites. Those addresses are
+      # pointed back at this proxy, so the player fetches the pictures through
+      # the VPN too. For that the list has to arrive as plain text; it is
+      # compressed again for the app if the app asks.
       location = /player_api.php {
         proxy_read_timeout 300s;
         chunked_transfer_encoding on;
         proxy_set_header Connection "";
-        proxy_set_header Accept-Encoding $$http_accept_encoding;
+        proxy_set_header Accept-Encoding "";
         proxy_set_header X-Hls-Provider "";
         proxy_set_header X-Hls-Renew "";
+        gzip on;
+        gzip_types application/json text/plain;
+        gzip_proxied any;
+        gzip_min_length 1024;
+        sub_filter_types *;
+        sub_filter_once off;
+        sub_filter '"https:\/\/' '"http://$$http_host/__cdn/https/';
+        sub_filter '"http:\/\/'  '"http://$$http_host/__cdn/http/';
+        sub_filter '"https://'   '"http://$$http_host/__cdn/https/';
+        sub_filter '"http://'    '"http://$$http_host/__cdn/http/';
         proxy_pass $$provider$$up_uri;
       }
 
