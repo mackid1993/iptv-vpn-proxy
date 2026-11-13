@@ -1176,8 +1176,9 @@ move to other servers at any time. The proxy learns them instead:
 - The list is kept in a small Docker volume and loaded at every start, so a
   server is learned once. It is capped at 200 names, far more than a provider
   uses.
-- Only video servers reached by name over HTTPS are learned. Any other
-  server, and one that only hands out pictures, works the plain way.
+- Only video servers reached by name over HTTPS on the standard port are
+  learned. Any other server, and one that only hands out pictures, works the
+  plain way.
 
 nginx runs as a single worker, so every stream shares the same set of open
 connections.
@@ -1269,6 +1270,11 @@ with Docker Compose. They are written from each platform's documentation.
   proxy re-reads its settings once so it can keep connections to that server
   open, and that makes the player reconnect once. After that the server is
   remembered, across restarts too.
+- **Kept-open connections cover video servers reached by name over HTTPS on
+  the standard port.** That is how most providers serve video. A provider
+  that serves it over plain HTTP, on another port, or from a bare number
+  address still plays: each request to such a server sets up its own
+  connection, as a plain proxy would.
 - **A slow provider is still slow.** If a provider's server falls behind, the
   proxy cannot make up the difference. See
   [When something is wrong](#when-something-is-wrong) for how to tell that
