@@ -49,8 +49,9 @@ Use it only with services you are entitled to use.
 4. **Works with any player and any Xtream provider.** Nothing in it is written
    for one provider or one app.
 5. **No custom software.** It is stock gluetun and stock nginx, configured. The
-   only script is a short shell loop inside the compose file that reads your
-   settings at start.
+   only script is a few lines of shell inside the compose file. They read your
+   settings at start, and while the proxy runs they keep a list of the video
+   servers your streams come from.
 
 ## Why this exists
 
@@ -459,6 +460,8 @@ services:
       # volume so that when this container is recreated (a provider was added,
       # an update), channels that are playing carry on with the same session.
       - hls-memory:/var/cache/nginx/hls
+      # The video servers the proxy has learned (see "entrypoint" below).
+      - video-servers:/var/lib/video-servers
     configs:
       - source: proxy
         target: /etc/nginx/conf.d/default.conf
@@ -512,8 +515,59 @@ services:
           echo "PROVIDER $$name on port $$port -> $${url%/}"
         done
         [ "$$used" = " " ] && echo "NO PROVIDERS STARTED. nginx is running with none: fix .env and bring the stack up again."
+        # Keep connections to the provider's video servers open, the way a player
+        # talking to them directly does. nginx only reuses connections to servers
+        # it has a line for, and no server name is written in this file: nginx
+        # notes every video server a stream actually comes from (see "video
+        # servers" in the config below) and each new name gets a line of its own.
+        # The list is kept in a small Docker volume, so after the first time a
+        # server is seen it is already known at every later start and nothing has
+        # to be re-read while someone is watching.
+        # "max_fails=0": a server is never set aside after a failed request; the
+        # next request simply tries it again, as it would with no line for it.
+        # A provider can move to new servers at any time. A server that has never
+        # been seen works the old way (a new connection for every request) until
+        # the loop below adds it: it waits for a run of channel changes to end,
+        # then has nginx re-read its settings ONCE for all the new names.
+        vs=/etc/nginx/conf.d/video-servers.conf
+        kept=/var/lib/video-servers/learned.conf
+        mkdir -p /var/lib/video-servers; touch "$$kept"
+        # only lines of exactly the form this script writes are taken back in
+        grep -E '^upstream [A-Za-z0-9.-]+ \{ zone vs[0-9]+_[0-9]+ 64k; server [A-Za-z0-9.-]+:443 resolve max_fails=0; keepalive 8; keepalive_timeout 55s; \}$$' "$$kept" | head -n 200 > "$$vs" || true
+        nginx -t -q 2>/dev/null || : > "$$vs"                   # the kept list is unusable: start without it
+        (
+          seen=/var/run/video-servers.seen
+          : > "$$seen"
+          while sleep 5; do
+            [ -s "$$seen" ] || continue
+            new=$$(sort -u "$$seen"); : > "$$seen"
+            fresh=0
+            for h in $$new; do grep -qF "upstream $$h {" "$$vs" || fresh=1; done
+            [ "$$fresh" = 1 ] || continue
+            sleep 20                                            # let the channel changes finish
+            new=$$(printf '%s\n%s\n' "$$new" "$$(cat "$$seen")" | sort -u); : > "$$seen"
+            [ "$$(wc -l < "$$vs")" -gt 200 ] && : > "$$vs"        # far more than any provider uses: start the list over
+            cp "$$vs" "$$vs.before"; added=0
+            for h in $$new; do
+              case "$$h" in ""|*[!A-Za-z0-9.-]*|.*|-*) continue;; esac  # a plain server name and nothing else
+              case "$$h" in *[A-Za-z]*) ;; *) continue;; esac           # not a bare number address
+              grep -qF "upstream $$h {" "$$vs" && continue
+              n=$$(( $$(wc -l < "$$vs") + 1 ))
+              printf 'upstream %s { zone vs%s_%s 64k; server %s:443 resolve max_fails=0; keepalive 8; keepalive_timeout 55s; }\n' "$$h" "$$n" "$$(date +%s)" "$$h" >> "$$vs"
+              added=1
+            done
+            [ "$$added" = 1 ] || continue
+            if nginx -t -q 2>/dev/null; then cp "$$vs" "$$kept"; nginx -s reload 2>/dev/null; else cp "$$vs.before" "$$vs"; fi
+          done
+        ) &
         # nginx itself needs none of the settings (they are in the file written
         # above), so it starts without them.
+        # One nginx worker. The image default is one per CPU thread (20 on a
+        # 20-thread machine), and each worker keeps its own separate set of open
+        # connections to the video servers, so a stream bounced between workers
+        # kept opening new ones. A home proxy carries a handful of streams; one
+        # worker handles them all and reuses the same connections for all of them.
+        sed -i "s/^worker_processes .*/worker_processes 1;/" /etc/nginx/nginx.conf
         exec env -i PATH="$$PATH" TZ="$${TZ:-UTC}" /docker-entrypoint.sh nginx -g 'daemon off;'
 
     # Healthy = nginx is still inside the tunnel container's network AND it
@@ -530,6 +584,7 @@ services:
 
 volumes:
   hls-memory:
+  video-servers:
 
 configs:
   proxy:
@@ -541,6 +596,8 @@ configs:
       # ---- Logging. Xtream addresses contain the login, so the address is never logged.
       map $$uri $$kind {
         default                              api;
+        ~^/__cdu/.*\.m3u8$$                   cdn-playlist;
+        ~^/__cdu/                            cdn-media;
         ~^/__cdn/.*\.m3u8$$                   cdn-playlist;
         ~^/__cdn/                            cdn-media;
         ~^/__ch/.*\.m3u8$$                    hls;
@@ -549,7 +606,23 @@ configs:
         ~^/(live|movie|series|timeshift)/    media;
         /xmltv.php                           guide;
       }
-      log_format masked '$$remote_addr [$$time_local] $$server_port $$status $$body_bytes_sent $$request_time done=$$request_completion up=$$upstream_status up_bytes=$$upstream_bytes_received up_time=$$upstream_response_time m=$$request_method rng="$$http_range" ua="$$http_user_agent" k=$$kind s=$$sess uh=$$proxy_host';
+      log_format masked '$$remote_addr [$$time_local] $$server_port $$status $$body_bytes_sent $$request_time done=$$request_completion up=$$upstream_status up_bytes=$$upstream_bytes_received up_time=$$upstream_response_time m=$$request_method rng="$$http_range" ua="$$http_user_agent" k=$$kind s=$$sess uh=$$proxy_host uct=$$upstream_connect_time';
+      # ---- Video servers. Every request that was answered by a server on the
+      # ---- usual secure port, reached by name, has that name noted in a small
+      # ---- file. The loop in "entrypoint" above reads it every few seconds and
+      # ---- gives each new server a line of its own, so nginx keeps connections
+      # ---- to it open and reuses them. Nothing here names a server.
+      map $$upstream_status $$vs_ok {
+        default        0;
+        ~(^|\s)20[06]$$  1;
+      }
+      # ---- Only video counts: a playlist, a video piece, a stream or a film.
+      # ---- Servers that only hand out pictures (logos, posters) are not noted.
+      map "$$vs_ok:$$proxy_port:$$proxy_host $$upstream_http_content_type" $$vs_note {
+        default                        0;
+        "~*^1:443:[A-Za-z0-9.-]+ (video/|audio/|application/(vnd\.apple\.mpegurl|x-mpegurl|mpegurl|octet-stream))"  1;
+      }
+      log_format vs '$$proxy_host';
       error_log /dev/stderr crit;                # upstream error lines would print the address, login included
 
       # ---- Plain reverse-proxy settings, the same for everything.
@@ -598,16 +671,92 @@ configs:
         "~*^/__cdn/https?/(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|\[|[^/]*[@%])"  1;
       }
 
+      # ---- 2b. /__cdu/: the same as /__cdn/, for one kind of address only: a
+      # ---- "../" line from a live channel's playlist (see $$cdn_up in part 3).
+      # ---- Such an address is /__cdu/<scheme>/<server>, then 32 spare folders
+      # ---- named "__up", then one named "__top", then the playlist's real folder
+      # ---- and the "../" line itself. The player does the climbing. Climbing
+      # ---- inside the real folders leaves the spares alone (first rule below).
+      # ---- Climbing higher than the server's top folder uses up "__top" and then
+      # ---- spares, never the server's name, and what is left is counted from
+      # ---- the top folder (second rule), which is where a player talking to the
+      # ---- server directly ends up too. /__cdn/ itself is not changed in any way.
+      map $$request_uri $$cdu_target {
+        default "";
+        "~*^/__cdu/(?<ua>https?)/(?<ub>[^/?]+)(/__up){32}/__top(?<uc>/.*)$$"  $$ua://$$ub$$uc;
+        "~*^/__cdu/(?<ua>https?)/(?<ub>[^/?]+)(/__up)*(?<uc>/.*)$$"           $$ua://$$ub$$uc;
+      }
+      map $$request_uri $$cdu_server {             # the server alone
+        default "";
+        "~*^/__cdu/(?<ue>https?)/(?<uf>[^/?]+)"  $$ue://$$uf;
+      }
+      map $$request_uri $$cdu_prefix {             # the same server's ordinary /__cdn/ address
+        default "";
+        "~*^/__cdu/(?<ug>https?)/(?<ui>[^/?]+)"  /__cdn/$$ug/$$ui;
+      }
+      map $$request_uri $$cdu_scheme {
+        default http;
+        ~*^/__cdu/https/  https;
+      }
+      map $$request_uri $$cdu_forbidden {         # nothing on this machine or this network (the same list as for /__cdn/)
+        default 0;
+        "~*^/__cdu/https?/(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|\[|[^/]*[@%])"  1;
+      }
+      # A few players send ".." as written instead of working it out. Normally
+      # that is passed on untouched and the video server works it out, as it would
+      # without the proxy. Only when such an address climbs higher than the
+      # server's top folder (the spares are no longer all there once nginx has
+      # worked the path out) is nginx's worked-out path used instead.
+      map $$request_uri $$cdu_dots {
+        default 0;
+        "~*^/__cdu/[^?]*/\.\.?(/|\?|$$)"  1;
+      }
+      map $$uri $$cdu_state {
+        default lost;                              # climbed past the spares and the server's name: nothing left to go by
+        "~*^/__cdu/https?/[^/]+(/__up){32}/__top(/|$$)"  intact;
+        "~*^/__cdu/https?/[^/]+(/__up)*/"               over;
+      }
+      map "$$cdu_dots:$$cdu_state" $$cdu_fix {
+        default  ok;
+        "1:over" over;
+        "1:lost" lost;
+      }
+
       # ---- 3. HLS playlists name their video pieces without a server (or with the
       # ---- other server's full address). Point those lines back at this proxy too.
+      # http or https of the server the playlist in hand came from (for "//server/path")
+      map "$$cdn|$$pscheme" $$cdn_rel {
+        default            /__cdn/https;
+        ~^/__cdn/http/     /__cdn/http;
+        ~^\|http$$         /__cdn/http;
+      }
       sub_filter_types application/vnd.apple.mpegurl application/x-mpegurl application/mpegurl audio/mpegurl audio/x-mpegurl;
       sub_filter_once off;
+      # An address written as "//server/path" means "same http or https as this
+      # playlist, on that other server". These two rules must stay ABOVE the
+      # "/..." rules below: nginx uses the first rule that fits.
+      sub_filter "\n//"           "\n$$cdn_rel/";
+      sub_filter 'URI="//'        'URI="$$cdn_rel/';
       sub_filter "\n/"            "\n$$cdn/";
       sub_filter 'URI="/'         'URI="$$cdn/';
       sub_filter "\nhttps://"     "\n/__cdn/https/";
       sub_filter "\nhttp://"      "\n/__cdn/http/";
       sub_filter 'URI="https://'  'URI="/__cdn/https/';
       sub_filter 'URI="http://'   'URI="/__cdn/http/';
+      # An address written as "../folder/file" means "up one folder from this
+      # playlist". A live channel's playlist is handed to the player in a made-up
+      # folder (/__ch/..., see part 4), where "up one folder" leads nowhere. For
+      # those playlists $$cdn_up is the playlist's real folder on its own server,
+      # reached through /__cdu/ (part 2b), followed by "../", so the player does
+      # the climbing on the real address ("../../x" works the same way).
+      # Everywhere else $$cdn_up is just "../" and these two rules change nothing:
+      # a playlist fetched through /__cdn/ or /__cdu/ sits at its real address
+      # already, and its "../" lines are passed on exactly as they are.
+      # Not covered, because nothing is left to go by: a line that climbs more
+      # than 32 folders higher than the server's top folder. Not rewritten, and
+      # so no better than before: "./../x", "folder/../../x" and a bare "..".
+      sub_filter "\n../"          "\n$$cdn_up";
+      sub_filter 'URI="../'       'URI="$$cdn_up';
 
       # ---- 4. Live HLS: one provider session per channel.
       # ---- Many providers start a NEW session every time a channel's address is
@@ -625,7 +774,8 @@ configs:
         location = /healthz { return 200; }     # the container's health check
         location / {
           set $$cdn "";
-          set $$sess "-";                       # (these three keep the config valid when no provider is set up)
+          set $$cdn_up "../";
+          set $$sess "-";                       # (these keep the config valid when no provider is set up)
           set $$pscheme http;
           proxy_redirect off;
           proxy_buffering on;                   # needed to remember an answer; this one is only a redirect
@@ -633,7 +783,8 @@ configs:
           proxy_cache_key "$$http_x_hls_provider$$uri";   # the channel address; a query string never names another channel
           proxy_cache_valid 301 302 303 307 308 365d;  # only the "it is over there" answer is remembered, for as long as the channel is in use
           proxy_cache_lock on;                  # opens arriving together wait for the first one
-          proxy_cache_lock_timeout 5s;
+          proxy_cache_lock_timeout 20s;         # ...for as long as a slow provider may take to answer; with a shorter
+          proxy_cache_lock_age 20s;             # wait, the later opens went to the provider too and ended the first session
           proxy_cache_bypass $$http_x_hls_renew; # asked to replace a session that is gone
           proxy_ignore_headers Cache-Control Expires Set-Cookie Vary X-Accel-Expires;
           add_header X-Hls-Sess $$upstream_cache_status always;
@@ -648,8 +799,10 @@ configs:
   provider-locations:
     content: |
       access_log /dev/stdout masked;
+      access_log /var/run/video-servers.seen vs if=$$vs_note;   # see "Video servers" above
       set $$sess   "-";
       set $$cdn    "";
+      set $$cdn_up "../";                     # "../" in a playlist stays "../" unless a channel-folder playlist says otherwise (see part 3)
       set $$chmode "";
       set $$pbase  "";
 
@@ -727,6 +880,7 @@ configs:
       # ---- session's playlist. The player always asks the same address and always
       # ---- gets the same session.
       location ~ ^/__ch/.+\.m3u8/__index\.m3u8$$ {
+        chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
         if ($$chmode != playlist) { return 404; }
         sub_filter_types *;
         proxy_redirect off;
@@ -740,6 +894,7 @@ configs:
         proxy_pass http://127.0.0.1:8195$$up_uri;
       }
       location @hls {
+        chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
         sub_filter_types *;
         proxy_intercept_errors on;
         recursive_error_pages on;
@@ -750,10 +905,12 @@ configs:
         if ($$next ~ "^/[^/]") { set $$next "$$provider$$next"; }     # "/some/path" with no server name
         if ($$next ~* "^https?://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|\[|[^/]*[@%])") { return 403; }
         if ($$next ~* "^(https?)://([^/]+)") { set $$cdn "/__cdn/$$1/$$2"; }
+        if ($$next ~* "^(?<us>https?)://(?<uh>[^/?]+)(?<ud>/([^?]*/)?)") { set $$cdn_up "/__cdu/$$us/$$uh/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__top$$ud../"; }   # the playlist's real folder, for "../" lines
         error_page 400 401 403 404 410 429 500 502 503 504 509 520 521 522 523 524 = @hls_renew;   # the remembered session is gone
         proxy_pass $$next;
       }
       location @hls_renew {                   # open the channel again, once, and remember the new session
+        chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
         proxy_redirect off;
         proxy_intercept_errors on;
         recursive_error_pages on;
@@ -765,14 +922,17 @@ configs:
         proxy_pass http://127.0.0.1:8195$$up_uri;
       }
       location @hls_renewed {                 # whatever this one answers goes to the player
+        chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
         sub_filter_types *;
         proxy_read_timeout 25s;
+        set $$cdn_up "../";                   # not the folder of the session that was just replaced
         set $$sess $$upstream_http_x_hls_sess;
         set $$next $$upstream_http_location;
         if ($$next ~ "^//") { set $$next "$$pscheme:$$next"; }
         if ($$next ~ "^/[^/]") { set $$next "$$provider$$next"; }
         if ($$next ~* "^https?://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|\[|[^/]*[@%])") { return 403; }
         if ($$next ~* "^(https?)://([^/]+)") { set $$cdn "/__cdn/$$1/$$2"; }
+        if ($$next ~* "^(?<us>https?)://(?<uh>[^/?]+)(?<ud>/([^?]*/)?)") { set $$cdn_up "/__cdu/$$us/$$uh/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__top$$ud../"; }   # the playlist's real folder, for "../" lines
         proxy_pass $$next;
       }
 
@@ -781,6 +941,7 @@ configs:
       # ---- no server and no folder. It lives next to that playlist, so fetch it
       # ---- from the folder the channel's session is in.
       location ~ ^/__ch/ {
+        chunked_transfer_encoding on;         # a further playlist in the channel's folder keeps the connection open too (pieces carry their length and are not affected)
         if ($$chmode != piece) { return 404; }
         limit_except GET HEAD { deny all; }
         proxy_redirect off;
@@ -794,6 +955,7 @@ configs:
         proxy_pass http://127.0.0.1:8195$$up_uri;
       }
       location @hls_piece {
+        chunked_transfer_encoding on;
         set $$sess $$upstream_http_x_hls_sess;
         set $$next $$upstream_http_location;
         if ($$next ~ "^//") { set $$next "$$pscheme:$$next"; }
@@ -803,6 +965,9 @@ configs:
         if ($$next ~* "^https?://[^/?]+(?<nd>/[^?]*/)") { set $$pdir $$nd; }
         if ($$next ~* "^(?<ns>https?)://(?<nh>[^/?]+)") { set $$cdn "/__cdn/$$ns/$$nh"; set $$pbase "$$ns://$$nh"; }
         if ($$pbase = "") { return 502; }
+        set $$cn_dir "";                       # a further playlist in the channel's folder: its own real folder, for "../" lines
+        if ($$cn ~ "^(?<cnf>.*/)[^/]*$$") { set $$cn_dir $$cnf; }
+        set $$cdn_up "/__cdu/$$ns/$$nh/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__top$$pdir$${cn_dir}../";
         proxy_redirect ~*^(https?)://([^/]+)(/.*)?$$ /__cdn/$$1/$$2$$3;
         proxy_redirect ~^//([^/]+)(/.*)?$$ /__cdn/$$ns/$$1$$2;
         proxy_redirect ~^(/[^/].*)$$ $$cdn$$1;
@@ -817,6 +982,7 @@ configs:
       # ---- that same folder, and "the pieces" above knows which channel they belong to.
       # ---- If the provider answers with the playlist itself, it is passed on as is.
       location ~ \.m3u8$$ {
+        chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
         sub_filter_types *;                   # a playlist is rewritten whatever type the provider labels it
         proxy_redirect off;
         proxy_intercept_errors on;
@@ -847,6 +1013,7 @@ configs:
 
         # A playlist fetched from the other server: rewritten whatever type it is labelled.
         location ~ \.m3u8$$ {
+          chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
           sub_filter_types *;
           set $$cdn $$cdn_prefix;
           set $$cdn_s $$cdn_scheme;
@@ -854,6 +1021,37 @@ configs:
           if ($$cdn_target = "") { return 404; }
           limit_except GET HEAD { deny all; }
           proxy_pass $$cdn_target;
+        }
+      }
+
+      # A "../" line from a live channel's playlist (see part 2b). The same as
+      # /__cdn/ above in every other way.
+      location ^~ /__cdu/ {
+        set $$cdn $$cdu_prefix;
+        set $$cdn_s $$cdu_scheme;
+        set $$cdu_to $$cdu_target;
+        if ($$cdu_forbidden) { return 403; }
+        if ($$cdu_target = "") { return 404; }
+        limit_except GET HEAD { deny all; }
+        proxy_redirect ~*^(https?)://([^/]+)(/.*)?$$ /__cdn/$$1/$$2$$3;
+        proxy_redirect ~^//([^/]+)(/.*)?$$ /__cdn/$$cdn_s/$$1$$2;
+        proxy_redirect ~^(/[^/].*)$$ $$cdn$$1;
+        if ($$cdu_fix = lost) { return 404; }
+        if ($$cdu_fix = over) { set $$cdu_to $$cdu_server; rewrite "(?i)^/__cdu/https?/[^/]+(/__up)*(?<dn>/.*)$$" $$dn break; }   # ".." as written, climbing too high: nginx's worked-out path, counted from the top folder
+        proxy_pass $$cdu_to;
+
+        location ~ \.m3u8$$ {
+          chunked_transfer_encoding on;
+          sub_filter_types *;
+          set $$cdn $$cdu_prefix;
+          set $$cdn_s $$cdu_scheme;
+          set $$cdu_to $$cdu_target;
+          if ($$cdu_forbidden) { return 403; }
+          if ($$cdu_target = "") { return 404; }
+          limit_except GET HEAD { deny all; }
+          if ($$cdu_fix = lost) { return 404; }
+          if ($$cdu_fix = over) { set $$cdu_to $$cdu_server; rewrite "(?i)^/__cdu/https?/[^/]+(/__up)*(?<dn>/.*)$$" $$dn break; }
+          proxy_pass $$cdu_to;
         }
       }
 ```
@@ -935,7 +1133,7 @@ In either arrangement, see the note on pictures under
 
 ## How it works
 
-Most of what the proxy does is pass bytes along. Five things go beyond that,
+Most of what the proxy does is pass bytes along. Six things go beyond that,
 and each one exists to keep the behavior the same as a direct connection:
 
 1. **Redirects stay inside the tunnel.** Providers answer most requests with
@@ -953,15 +1151,42 @@ and each one exists to keep the behavior the same as a direct connection:
    so the real logins are typed in one place only.
 5. **It refuses to be pointed at your own network.** A request cannot make the
    proxy fetch from the machine it runs on or from private addresses.
+6. **Connections are kept open and reused.** A player connected directly keeps
+   its connection to a server open and sends one request after another over
+   it. The proxy does the same on both sides. A playlist answer leaves the
+   player's connection open for the next refresh, and the proxy keeps its own
+   connections to the provider's video servers open instead of setting one up
+   for every playlist refresh and every video piece. Setting up an encrypted
+   connection takes time, and one slow setup can use up a player's small live
+   buffer and show as a stutter.
 
 Your settings are read once, when the proxy starts. A short shell loop turns
 each provider block in `.env` into its own listener on its own port.
 
+No video server is named anywhere in the two files, because a provider can
+move to other servers at any time. The proxy learns them instead:
+
+- It notes the name of each server that video or a playlist really came from.
+- A second short loop gives each name it has not seen a place on its list of
+  servers to keep connections open to. It waits about 20 seconds for channel
+  changes to settle, then has nginx re-read its settings once for all the
+  names it collected.
+- Until then, a server it has not seen works the plain way, with a connection
+  set up for each request.
+- The list is kept in a small Docker volume and loaded at every start, so a
+  server is learned once. It is capped at 200 names, far more than a provider
+  uses.
+- Only video servers reached by name over HTTPS are learned. Any other
+  server, and one that only hands out pictures, works the plain way.
+
+nginx runs as a single worker, so every stream shares the same set of open
+connections.
+
 ## What was tested, and how
 
-The goal is parity with direct credentials, and no gap is known. Some of that
-was confirmed against real providers and some only against simulated ones, so
-here is which is which.
+The goal is parity with direct credentials, and no gap has been seen with a
+real provider. Some of that was confirmed against real providers and some only
+against simulated ones, so here is which is which.
 
 **Confirmed against real providers:**
 
@@ -975,6 +1200,20 @@ here is which is which.
 - A session ended by the provider being replaced without a failed request
 - Restarting the proxy while a channel is playing
 - Logos and posters loading through the proxy
+- Several opens of one channel arriving at the same moment ending up on one
+  session
+- A playlist refresh reusing the player's open connection
+- Video servers being learned from what was played, and connections to them
+  being reused for playlists and video pieces
+- The learned servers still being known after the proxy was restarted
+
+Connection reuse was measured on a real provider by reading the proxy's log
+while live channels played. About 99 percent of requests reused an open
+connection, and the rest connected in a few hundredths of a second, with no
+visible stutter over a long viewing session. Without reuse, every playlist
+refresh and every video piece set up its own encrypted connection, and an
+occasional one took about a second, which was enough to empty the player's
+live buffer and show as a stutter.
 
 **Confirmed against simulated providers only.** These are behaviors a provider
 could have that the real ones used for testing did not, so a stand-in was
@@ -985,6 +1224,13 @@ service:
   including a further playlist in a sub-folder
 - A provider that answers with the playlist itself instead of a redirect
 - Redirects written in less common forms
+- Playlist lines written as `//server/path` (another server, same http or
+  https)
+- Playlist lines written as `../folder/file` in a live channel's playlist,
+  with a player that works the `..` out itself and with one that sends it as
+  written. A few rarer forms are not handled there: `./../x`,
+  `folder/../../x`, a bare `..`, and a line that climbs more than 32 folders
+  above the server's top folder.
 - Playlists labeled with an unusual content type
 - Logins full of special characters (`@ # % & + = ? / " $ ; { } \`, an
   apostrophe, non-English letters)
@@ -1017,6 +1263,12 @@ with Docker Compose. They are written from each platform's documentation.
   through the VPN.
 - **Your logins are in `.env` in plain text**, and the session memory
   (below) holds them too. Keep the folder private.
+- **A video server is learned the first time it is used.** Until the proxy
+  has seen a video server, each request to it sets up its own connection, as
+  a plain proxy would. About 20 seconds after the channel changes settle, the
+  proxy re-reads its settings once so it can keep connections to that server
+  open, and that makes the player reconnect once. After that the server is
+  remembered, across restarts too.
 - **A slow provider is still slow.** If a provider's server falls behind, the
   proxy cannot make up the difference. See
   [When something is wrong](#when-something-is-wrong) for how to tell that
@@ -1026,9 +1278,11 @@ with Docker Compose. They are written from each platform's documentation.
 
 ## What it stores, updating, removing
 
-**What it stores.** Besides the two files you put there, one small Docker
-volume named `iptv-vpn_hls-memory`. Docker creates and manages it; there is no
-folder for you to make or look after.
+**What it stores.** Besides the two files you put there, two small Docker
+volumes. Docker creates and manages them; there is no folder for you to make
+or look after.
+
+`iptv-vpn_hls-memory` is the session memory:
 
 - For each live HLS channel being watched it holds one file of about 3 KB: the
   provider's "this channel is on that server" answer. The file includes the
@@ -1037,6 +1291,16 @@ folder for you to make or look after.
 - It exists so that when the proxy container is recreated (you added a
   provider, or updated), channels that are playing carry on with the same
   session instead of being given a new one, which can show as buffering.
+
+`iptv-vpn_video-servers` is the list of video servers the proxy has learned:
+
+- It holds one small text file with one line per server, 200 at most. The
+  lines contain server names only: no logins and no channel addresses.
+- It exists so that a server seen once is already known at every later start,
+  and the proxy does not have to re-read its settings while someone is
+  watching.
+- Nothing in it is needed to play. If it is removed, the proxy learns the
+  servers again as they are used.
 
 **Updating.**
 
@@ -1054,7 +1318,7 @@ folder for you to make or look after.
 docker compose down -v
 ```
 
-The `-v` matters: it removes the session volume too. A plain `down` leaves it
+The `-v` matters: it removes both volumes too. A plain `down` leaves them
 behind. Then delete the folder.
 
 ## Extras that need one more file
@@ -1115,7 +1379,9 @@ same everywhere; what differs is where they live and how you start them.
   just as slow with the provider's login typed straight into a player.
 - **Reading the log.** `k=` is the kind of request. `s=` shows whether a
   channel's session was reused (`HIT`), opened (`MISS`) or replaced
-  (`BYPASS`).
+  (`BYPASS`). `uh=` is the server the answer came from. `uct=` is how long
+  it took to connect to that server, in seconds; `0.000` means an open
+  connection was reused.
 
 ## Support
 
