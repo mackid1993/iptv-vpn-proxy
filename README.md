@@ -43,9 +43,13 @@ on any of them.
   MPEG-TS is now fed from the channel's HLS session, the one your players are
   already on. A recorder and a viewer on one channel no longer knock each
   other off.
-- **HLS: the provider is let go sooner when you stop.** An idle connection to
-  a provider's video server is now closed after 20 seconds instead of 55.
-  Connections are still reused while a channel plays.
+- **HLS: the proxy lets go of the provider sooner when you stop.** The proxy
+  keeps its connection to a provider's video server open for a while after
+  the last request, so the next one can reuse it. That time is now 20 seconds;
+  it was 55. This is only the proxy's side. How long the provider itself goes
+  on counting you as connected after you stop is up to the provider and is
+  usually longer; no fixed figure is claimed for it here. Connections are
+  still reused while a channel plays.
 - **nginx is still plain nginx.** It is the stock image with settings only and
   no add-on scripting. Everything new that needed a program lives in the
   relay. If the relay is not running, TV still plays, without the sharing and
