@@ -203,9 +203,9 @@ Each provider gets its own port. The same easy login works for all of them.
 
 ## The two files
 
-`.env.example` is shown here in full so you can read it without leaving the
-page. Click the heading to open it. `compose.yaml` is linked instead, because
-it is about 2,000 lines long.
+These are the same files that sit in this repository, shown here in full so
+you can read and copy them without leaving the page. Click a heading to open
+it.
 
 ### `.env.example`: every setting, with instructions
 
@@ -451,9 +451,10 @@ PROXY_PORTS=8095-8096
 
 ### `compose.yaml`: the stack itself
 
-You do not edit this one. Get it from this repository:
-[compose.yaml](compose.yaml). It defines the three containers and holds, as
-plain text with a comment on each part saying what it is for:
+You do not edit this one. It is in this repository as
+[compose.yaml](compose.yaml) and shown in full below. It defines the three
+containers and holds, as plain text with a comment on each part saying what it
+is for:
 
 - the whole nginx configuration
 - the short shell script that reads your settings when nginx starts
@@ -462,6 +463,2104 @@ plain text with a comment on each part saying what it is for:
 
 Nothing is downloaded or installed when the stack starts except the three
 stock images.
+
+<details>
+<summary><b>Show compose.yaml</b></summary>
+
+```yaml
+##############################################################################
+# IPTV through a VPN, with nothing to install on your devices
+#
+#   iptv-vpn     gluetun. Holds the VPN tunnel (WireGuard or OpenVPN, any
+#                provider gluetun supports).
+#   iptv-nginx   A reverse proxy in front of your IPTV providers. It lives
+#                inside the tunnel's network, so everything it fetches from a
+#                provider goes out through the VPN and nothing else can.
+#   iptv-relay   A small helper beside nginx, also inside the tunnel's
+#                network. When several of your devices watch or record the
+#                same live channel, it lets them share one connection to
+#                the provider. It also draws the status page. It is plain
+#                Python in the stock Python image; its whole text is at the
+#                bottom of this file.
+#
+# Your players and playlist managers connect to this machine instead of to
+# the provider:
+#        http://<this machine>:<the provider's port>
+#        username / password = PLAYER_USER / PLAYER_PASSWORD from .env
+# and behave as if the provider's own Xtream login had been typed into them.
+#
+# YOU NEVER EDIT THIS FILE. Every setting is in .env (copy .env.example to
+# .env and fill it in). To add a provider, add five lines to .env:
+#        NAME_URL=https://provider.example
+#        NAME_PORT=8095
+#        NAME_USER=...
+#        NAME_PASSWORD=...
+#        NAME_LIVE_TV=hls          (or ts: how your players watch its live TV)
+# then bring the stack up again. The iptv-nginx log lists the providers it
+# found at each start, and names any it skipped and why.
+#
+# What the proxy does besides passing bytes on (each part is explained where
+# it sits in the config at the bottom of this file):
+#   1. keeps redirects inside the tunnel
+#   2. refuses to be pointed at this machine or your home network
+#   3. points the pieces of an HLS playlist back at itself
+#   4. keeps ONE provider session per live HLS channel
+#   5. swaps the easy login for the provider's
+#   6. keeps ONE provider connection per live channel for MPEG-TS readers
+#      and recorders too (done by the small "relay" beside nginx)
+#
+# To see what is set up, and what is wrong when something is, open
+#        http://<this machine>:<any provider's port>/status
+# in a web browser. The iptv-nginx log prints that address at every start.
+#
+# Each container keeps a log of what it is doing:
+#        docker logs iptv-vpn        the VPN tunnel
+#        docker logs iptv-nginx      the providers it found, and every request
+#        docker logs iptv-relay      each live channel it opens and closes,
+#                                    and anything that went wrong with one
+#
+# Works with HLS, MPEG-TS, movies, series, catch-up and the guide.
+#
+# FOR YOUR HOME NETWORK ONLY. The proxy ports have no protection of their
+# own. Never forward them from the internet; reach them from outside with
+# your own private network (Tailscale, WireGuard, ...) instead.
+#
+# Good to know:
+#   - Xtream logins only. A provider's ready-made M3U link (get.php) is
+#     refused, because the addresses inside it skip the VPN.
+#   - When a player logs in, the provider's reply includes the provider's own
+#     server address, and the proxy passes that reply on unchanged. A player
+#     that connects to that address instead of the one you typed would skip
+#     the VPN.
+#   - Logos and posters named in the provider's lists are pointed back at
+#     the proxy, so they come through the VPN too. Pictures named inside the
+#     guide file are not; the player fetches those directly.
+##############################################################################
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # The VPN tunnel. Anything sharing this container's network has no other way
+  # out, so if the tunnel is down nothing leaks. All of its settings are
+  # gluetun's own, read from .env (see the notes there).
+  # ---------------------------------------------------------------------------
+  vpn:
+    image: qmcgaw/gluetun:latest
+    container_name: iptv-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      # Every provider port, same number inside and out. One range covers all
+      # providers, present and future. The range is PROXY_PORTS in .env: set it
+      # to whatever ports are free on your machine.
+      - "${PROXY_PORTS:-8095-8096}:${PROXY_PORTS:-8095-8096}"
+    # The VPN settings, taken from .env by name. A setting you leave out of
+    # .env is simply not passed on, and gluetun uses its own default. Only a
+    # change to one of these (or to PROXY_PORTS) restarts the tunnel; adding or
+    # changing an IPTV provider does not.
+    environment:
+      - TZ
+      - VPN_SERVICE_PROVIDER
+      - VPN_TYPE
+      - SERVER_COUNTRIES
+      - SERVER_REGIONS
+      - SERVER_CITIES
+      - SERVER_HOSTNAMES
+      - WIREGUARD_PRIVATE_KEY
+      - WIREGUARD_ADDRESSES
+      - WIREGUARD_PRESHARED_KEY
+      - WIREGUARD_PUBLIC_KEY
+      - WIREGUARD_ENDPOINT_IP
+      - WIREGUARD_ENDPOINT_PORT
+      - WIREGUARD_MTU
+      - WIREGUARD_PERSISTENT_KEEPALIVE_INTERVAL
+      - WIREGUARD_IMPLEMENTATION
+      - OPENVPN_USER
+      - OPENVPN_PASSWORD
+      - OPENVPN_PROTOCOL
+      - OPENVPN_CUSTOM_CONFIG
+      - FIREWALL_OUTBOUND_SUBNETS
+      - DNS_UPSTREAM_RESOLVER_TYPE
+      - DNS_UPSTREAM_RESOLVERS
+      - DNS_UPSTREAM_PLAIN_ADDRESSES
+      - BLOCK_MALICIOUS
+      # gluetun's own control page stays inside the container.
+      - HTTP_CONTROL_SERVER_ADDRESS=127.0.0.1:8000
+
+  # ---------------------------------------------------------------------------
+  # nginx. Shares the tunnel's network. Its whole configuration is the text
+  # under "configs:" at the bottom of this file.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: iptv-nginx
+    restart: unless-stopped
+    network_mode: "service:vpn"         # all its traffic goes through the tunnel
+    depends_on:
+      vpn:
+        condition: service_healthy
+        restart: true                   # comes back with the tunnel
+    # The provider lines are read from your settings file. That file is .env;
+    # Portainer saves the one you upload as stack.env. Whichever exists is used.
+    env_file:
+      - path: .env
+        required: false
+      - path: stack.env
+        required: false
+    volumes:
+      # Where the proxy remembers each channel's session. Kept in a small Docker
+      # volume so that when this container is recreated (a provider was added,
+      # an update), channels that are playing carry on with the same session.
+      - hls-memory:/var/cache/nginx/hls
+      # The video servers the proxy has learned (see "entrypoint" below).
+      - video-servers:/var/lib/video-servers
+    configs:
+      - source: proxy
+        target: /etc/nginx/conf.d/default.conf
+      - source: provider-locations
+        target: /etc/nginx/provider-locations.conf
+    # At every start: build one nginx server block per provider found in .env
+    # (any NAME with NAME_URL, NAME_PORT, NAME_USER, NAME_PASSWORD and
+    # NAME_LIVE_TV), then
+    # start nginx as usual. A provider with a missing or unusable line is
+    # skipped and named in the log; the others still start.
+    #
+    # Provider logins may contain ANY characters. Each one is percent-encoded
+    # here (letters, digits and - . _ ~ stay as they are; everything else
+    # becomes %XX), which is the form a URL needs, so nginx only ever sees
+    # safe text and the provider receives exactly the login it issued.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        # The status page is drawn by the relay. nginx hands it the request, and
+        # lets it read this start's notes about what was found (written below).
+        cat > /etc/nginx/status.inc <<'STATUS'
+        location = /status {
+          proxy_intercept_errors off;
+          proxy_read_timeout 30s;
+          proxy_set_header Connection "";
+          proxy_set_header Host $$http_host;
+          proxy_set_header X-Hls-Provider "";
+          proxy_set_header X-Hls-Renew "";
+          proxy_set_header X-Relay-Port $$server_port;
+          proxy_set_header X-Relay-User $$easy_user;
+          proxy_set_header X-Relay-Pass $$easy_pass;
+          proxy_set_header X-Relay-Provider "";
+          proxy_set_header X-Relay-Uri "";
+          proxy_set_header X-Relay-Orig "";
+          error_page 502 504 = @status_down;
+          proxy_pass http://127.0.0.1:8197/status;
+        }
+        location = /__status.json { allow 127.0.0.1; deny all; access_log off; default_type application/json; alias /etc/nginx/status.json; }
+        location @status_down { default_type text/plain; return 503 "The status page is drawn by the iptv-relay container, and it is not answering. Look at its log: docker logs iptv-relay\n"; }
+        STATUS
+        out=/etc/nginx/conf.d/providers.conf
+        : > "$$out"
+        enc() {
+          printf '%s' "$$1" | hexdump -v -e '1/1 "%02x\n"' | while read -r h; do
+            case "$$h" in
+              2d|2e|5f|7e|3[0-9]|4[1-9a-f]|5[0-9a]|6[1-9a-f]|7[0-9a]) printf "\\x$$h" ;;
+              *) printf '%%%s' "$$(echo "$$h" | tr a-f A-F)" ;;
+            esac
+          done
+        }
+        ports="$${PROXY_PORTS:-8095-8096}"; stop=""
+        # Notes for the status page (/status): what was found, what was left out and why.
+        notes=/tmp/status-notes; rm -rf "$$notes"; mkdir -p "$$notes"; : > "$$notes/problems"; : > "$$notes/providers"
+        clean() { printf '%s' "$$1" | tr -d '"\\' | tr '\n\r\t' '   '; }
+        echo "$$ports" | grep -Eqx '[1-9][0-9]{0,4}(-[1-9][0-9]{0,4})?' || stop="PROXY_PORTS must be one port or a range like 8095-8099 (found: $$ports)"
+        [ -z "$$stop" ] && [ "$$(printf '%s' "$$PLAYER_USER$$PLAYER_PASSWORD$$ports" | wc -l)" != 0 ] && stop="PLAYER_USER, PLAYER_PASSWORD and PROXY_PORTS must each be on one line"
+        [ -z "$$stop" ] && { echo "$$PLAYER_USER" | grep -Eqx '[A-Za-z0-9_-]+' && echo "$$PLAYER_PASSWORD" | grep -Eqx '[A-Za-z0-9_-]+' || stop="PLAYER_USER and PLAYER_PASSWORD must be letters, digits, - or _ only (they are yours to choose)"; }
+        [ -z "$$stop" ] && case "$$PLAYER_USER" in live|movie|series|timeshift) stop="PLAYER_USER cannot be live, movie, series or timeshift";; esac
+        lo=$${ports%-*}; hi=$${ports#*-}; used=" "
+        [ -n "$$stop" ] && { echo "PROXY SETTINGS PROBLEM: $$stop"; printf '"%s."\n' "$$(clean "$$stop")" >> "$$notes/problems"; }
+        env | sed -n 's/^\([A-Za-z0-9_]*[a-z][A-Za-z0-9_]*\)_URL=.*/\1/p' | while read -r low; do echo "PROVIDER $$low SKIPPED: the name must be in CAPITALS"; printf '{"name":"%s","port":"","ok":false,"why":"the name must be in CAPITALS"}\n' "$$(clean "$$low")" >> "$$notes/providers"; done
+        [ -z "$$stop" ] && for name in $$(env | sed -n 's/^\([A-Z][A-Z0-9_]*\)_URL=.*/\1/p' | sort); do
+          url=$$(printenv "$${name}_URL"); port=$$(printenv "$${name}_PORT")
+          user=$$(printenv "$${name}_USER"); pass=$$(printenv "$${name}_PASSWORD")
+          bad=""
+          case "$$name" in PROXY|PLAYER|VPN|OPENVPN|WIREGUARD|SERVER|FIREWALL|DNS) bad="$$name is one of the proxy's own names; pick another";; esac
+          [ -z "$$bad" ] && { [ -n "$$url" ] && [ -n "$$port" ] && [ -n "$$user" ] && [ -n "$$pass" ] || bad="needs $${name}_URL, _PORT, _USER and _PASSWORD"; }
+          [ -z "$$bad" ] && { echo "$$port" | grep -Eqx '[1-9][0-9]{0,4}' && [ "$$port" -le 65535 ] || bad="port must be a number from 1 to 65535"; }
+          [ -z "$$bad" ] && { echo "$$url" | grep -Eqx 'https?://[A-Za-z0-9._-]+(:[0-9]{1,5})?/?' || bad="address must be http://name or https://name, optionally :port, with nothing after it"; }
+          [ -z "$$bad" ] && case " 53 8000 8195 8197 9999 " in *" $$port "*) bad="port $$port is used inside the VPN container itself";; esac
+          [ -z "$$bad" ] && case "$$used" in *" $$port "*) bad="port $$port is already used by another provider";; esac
+          [ -z "$$bad" ] && { [ "$$port" -ge "$$lo" ] && [ "$$port" -le "$$hi" ] || bad="port $$port is outside PROXY_PORTS ($$ports)"; }
+          mode=$$(printenv "$${name}_LIVE_TV")
+          [ -z "$$bad" ] && [ "$$(printf '%s' "$$url$$port$$user$$pass$$mode" | wc -l)" != 0 ] && bad="one of its lines is broken over two lines"
+          [ -z "$$bad" ] && case "$$mode" in hls|ts) ;; *) bad="needs the line $${name}_LIVE_TV=hls if your players use HLS, or $${name}_LIVE_TV=ts if they use MPEG-TS";; esac
+          if [ -n "$$bad" ]; then echo "PROVIDER $$name SKIPPED: $$bad"; printf '{"name":"%s","port":"","ok":false,"why":"%s"}\n' "$$name" "$$(clean "$$bad")" >> "$$notes/providers"; continue; fi
+          used="$$used$$port "
+          printf 'server {\n  listen %s;\n  set $$provider  %s;\n  set $$pscheme   %s;\n  set $$acct_user "%s";\n  set $$acct_pass "%s";\n  set $$live_tv   %s;\n  include /etc/nginx/provider-locations.conf;\n}\n' \
+            "$$port" "$${url%/}" "$${url%%://*}" "$$(enc "$$user")" "$$(enc "$$pass")" "$$mode" >> "$$out"
+          echo "PROVIDER $$name on port $$port -> $${url%/}"
+          printf '{"name":"%s","port":"%s","ok":true,"mode":"%s"}\n' "$$name" "$$port" "$$mode" >> "$$notes/providers"
+          { [ -z "$$first" ] || [ "$$port" -lt "$$first" ]; } && first="$$port"
+        done
+        [ "$$used" = " " ] && echo "NO PROVIDERS STARTED. nginx is running with none: fix .env and bring the stack up again."
+        # The status page. With no provider running, one port still answers so the
+        # page can say what is wrong, and the container reports itself unhealthy.
+        : > /var/run/proxy-problem
+        if [ "$$used" = " " ]; then
+          echo "not set up" > /var/run/proxy-problem
+          first=$$(echo "$$lo" | grep -Ex '[1-9][0-9]{0,4}' || echo 8095)
+          printf 'server {\n  listen %s;\n  set $$easy_user "";\n  set $$easy_pass "";\n  include /etc/nginx/status.inc;\n  location / { default_type text/plain; return 503 "The IPTV proxy is not set up yet. Open /status on this address in a web browser to see what is missing.\\n"; }\n}\n' "$$first" >> "$$out"
+        fi
+        printf '{"problems":[%s],"providers":[%s]}\n' "$$(paste -sd, "$$notes/problems")" "$$(paste -sd, "$$notes/providers")" > /etc/nginx/status.json
+        rm -rf "$$notes"
+        echo "STATUS PAGE: open http://<this machine's address>:$$first/status in a web browser"
+        # Keep connections to the provider's video servers open, the way a player
+        # talking to them directly does. nginx only reuses connections to servers
+        # it has a line for, and no server name is written in this file: nginx
+        # notes every video server a stream actually comes from (see "video
+        # servers" in the config below) and each new name gets a line of its own.
+        # The list is kept in a small Docker volume, so after the first time a
+        # server is seen it is already known at every later start and nothing has
+        # to be re-read while someone is watching.
+        # "max_fails=0": a server is never set aside after a failed request; the
+        # next request simply tries it again, as it would with no line for it.
+        # A provider can move to new servers at any time. A server that has never
+        # been seen works the old way (a new connection for every request) until
+        # the loop below adds it: it waits for a run of channel changes to end,
+        # then has nginx re-read its settings ONCE for all the new names.
+        vs=/etc/nginx/conf.d/video-servers.conf
+        kept=/var/lib/video-servers/learned.conf
+        mkdir -p /var/lib/video-servers; touch "$$kept"
+        sed -i -E 's/ keepalive_timeout [0-9]+s; }$$/ keepalive_timeout 20s; }/' "$$kept"   # (an idle time from another version of this file)
+        # only lines of exactly the form this script writes are taken back in
+        grep -E '^upstream [A-Za-z0-9.-]+ \{ zone vs[0-9]+_[0-9]+ 64k; server [A-Za-z0-9.-]+:443 resolve max_fails=0; keepalive 8; keepalive_timeout 20s; \}$$' "$$kept" | head -n 200 > "$$vs" || true
+        nginx -t -q 2>/dev/null || : > "$$vs"                   # the kept list is unusable: start without it
+        (
+          seen=/var/run/video-servers.seen
+          : > "$$seen"
+          while sleep 5; do
+            [ -s "$$seen" ] || continue
+            new=$$(sort -u "$$seen"); : > "$$seen"
+            fresh=0
+            for h in $$new; do grep -qF "upstream $$h {" "$$vs" || fresh=1; done
+            [ "$$fresh" = 1 ] || continue
+            sleep 20                                            # let the channel changes finish
+            new=$$(printf '%s\n%s\n' "$$new" "$$(cat "$$seen")" | sort -u); : > "$$seen"
+            [ "$$(wc -l < "$$vs")" -gt 200 ] && : > "$$vs"        # far more than any provider uses: start the list over
+            cp "$$vs" "$$vs.before"; added=0
+            for h in $$new; do
+              case "$$h" in ""|*[!A-Za-z0-9.-]*|.*|-*) continue;; esac  # a plain server name and nothing else
+              case "$$h" in *[A-Za-z]*) ;; *) continue;; esac           # not a bare number address
+              grep -qF "upstream $$h {" "$$vs" && continue
+              n=$$(( $$(wc -l < "$$vs") + 1 ))
+              printf 'upstream %s { zone vs%s_%s 64k; server %s:443 resolve max_fails=0; keepalive 8; keepalive_timeout 20s; }\n' "$$h" "$$n" "$$(date +%s)" "$$h" >> "$$vs"
+              added=1
+            done
+            [ "$$added" = 1 ] || continue
+            if nginx -t -q 2>/dev/null; then cp "$$vs" "$$kept"; nginx -s reload 2>/dev/null; else cp "$$vs.before" "$$vs"; fi
+          done
+        ) &
+        # nginx itself needs none of the settings (they are in the file written
+        # above), so it starts without them.
+        # One nginx worker. The image default is one per CPU thread (20 on a
+        # 20-thread machine), and each worker keeps its own separate set of open
+        # connections to the video servers, so a stream bounced between workers
+        # kept opening new ones. A home proxy carries a handful of streams; one
+        # worker handles them all and reuses the same connections for all of them.
+        sed -i "s/^worker_processes .*/worker_processes 1;/" /etc/nginx/nginx.conf
+        exec env -i PATH="$$PATH" TZ="$${TZ:-UTC}" /docker-entrypoint.sh nginx -g 'daemon off;'
+
+    # Healthy = nginx is still inside the tunnel container's network AND the
+    # settings were usable (see the status page) AND it answers. If the
+    # tunnel container was restarted underneath nginx, nginx is
+    # left in a dead network with no address of its own; then the check
+    # waits a moment for the tunnel container to be back and stops nginx, so
+    # Docker starts it again inside the tunnel's new network.
+    healthcheck:
+      test: ["CMD-SHELL", "ip -o addr show scope global | grep -q . || { sleep 12; kill 1; exit 1; }; [ ! -s /var/run/proxy-problem ] || exit 1; wget -q -T 5 -O /dev/null http://127.0.0.1:8195/healthz || exit 1"]
+      interval: 30s
+      timeout: 20s
+      start_period: 20s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # The relay. Plain Python (the text under "relay" at the bottom of this file)
+  # in the stock Python image, with nothing installed. It shares the tunnel's
+  # network like nginx does, so it has no other way out. nginx hands it three
+  # kinds of request: live MPEG-TS (part 6 of nginx's notes), HLS playlists
+  # (part 3b) and the status page. The top of the script says what it does
+  # with each. If it is not running, TV still plays: nginx passes live
+  # MPEG-TS to the provider itself, each reader on a connection of its own,
+  # and rewrites playlists itself.
+  # ---------------------------------------------------------------------------
+  relay:
+    image: python:3-alpine
+    container_name: iptv-relay
+    restart: unless-stopped
+    network_mode: "service:vpn"
+    user: "65534:65534"                 # needs no privileges
+    depends_on:
+      vpn:
+        condition: service_healthy
+        restart: true
+    mem_limit: 512m                     # a ceiling: it uses about 30 MB at rest and some tens of MB for each channel being watched
+    env_file:
+      - path: .env
+        required: false
+      - path: stack.env
+        required: false
+    configs:
+      - source: relay
+        target: /relay.py
+    # Of everything in .env, the relay is given only the addresses of the
+    # providers that are set up (checked the way nginx checks them). No login,
+    # no password and no VPN key is kept in its environment.
+    command:
+      - sh
+      - -c
+      - |
+        list=""
+        for n in $$(env | sed -n 's/^\([A-Z][A-Z0-9_]*\)_URL=.*/\1/p'); do
+          case "$$n" in PROXY|PLAYER|VPN|OPENVPN|WIREGUARD|SERVER|FIREWALL|DNS) continue;; esac
+          case "$$(printenv "$${n}_LIVE_TV")" in hls|ts) ;; *) continue;; esac
+          printenv "$${n}_URL" | grep -Eqx 'https?://[A-Za-z0-9._-]+(:[0-9]{1,5})?/?' || continue
+          printenv "$${n}_PORT" | grep -Eqx '[1-9][0-9]{0,4}' || continue
+          [ -n "$$(printenv "$${n}_PORT")" ] && [ -n "$$(printenv "$${n}_USER")" ] && [ -n "$$(printenv "$${n}_PASSWORD")" ] || continue
+          list="$$list $$(printenv "$${n}_URL")"
+        done
+        exec env -i PATH="$$PATH" RELAY_PROVIDERS="$$list" python -u /relay.py
+    # Healthy = still inside the tunnel container's network AND answering. As
+    # with nginx: if the tunnel was restarted underneath it, it stops so that
+    # Docker starts it again inside the tunnel's new network.
+    healthcheck:
+      test: ["CMD-SHELL", "ip -o addr show scope global | grep -q . || { sleep 12; kill 1; exit 1; }; wget -q -T 5 -O /dev/null http://127.0.0.1:8197/healthz || exit 1"]
+      interval: 30s
+      timeout: 20s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  hls-memory:
+  video-servers:
+
+configs:
+  proxy:
+    content: |
+      # Names are looked up through the tunnel container's own DNS.
+      resolver 127.0.0.1 ipv6=off valid=60s;
+      resolver_timeout 5s;
+
+      # ---- Logging. Xtream addresses contain the login, so the address is never logged.
+      map $$uri $$kind {
+        default                              api;
+        ~^/__cdu/.*\.m3u8$$                   cdn-playlist;
+        ~^/__cdu/                            cdn-media;
+        ~^/__cdn/.*\.m3u8$$                   cdn-playlist;
+        ~^/__cdn/                            cdn-media;
+        ~^/__ch/.*\.m3u8$$                    hls;
+        ~^/__ch/                             hls-media;
+        ~\.m3u8$$                             hls-open;
+        ~^/(live|movie|series|timeshift)/    media;
+        /xmltv.php                           guide;
+      }
+      log_format masked '$$remote_addr [$$time_local] $$server_port $$status $$body_bytes_sent $$request_time done=$$request_completion up=$$upstream_status up_bytes=$$upstream_bytes_received up_time=$$upstream_response_time m=$$request_method rng="$$http_range" ua="$$http_user_agent" k=$$kind s=$$sess uh=$$proxy_host uct=$$upstream_connect_time';
+      # ---- Video servers. Every request that was answered by a server on the
+      # ---- usual secure port, reached by name, has that name noted in a small
+      # ---- file. The loop in "entrypoint" above reads it every few seconds and
+      # ---- gives each new server a line of its own, so nginx keeps connections
+      # ---- to it open and reuses them. Nothing here names a server.
+      map $$upstream_status $$vs_ok {
+        default        0;
+        ~(^|\s)20[06]$$  1;
+      }
+      # ---- Only video counts: a playlist, a video piece, a stream or a film.
+      # ---- Servers that only hand out pictures (logos, posters) are not noted.
+      map "$$vs_ok:$$proxy_port:$$proxy_host $$upstream_http_content_type" $$vs_note {
+        default                        0;
+        "~*^1:443:[A-Za-z0-9.-]+ (video/|audio/|application/(vnd\.apple\.mpegurl|x-mpegurl|mpegurl|octet-stream))"  1;
+      }
+      log_format vs '$$proxy_host';
+      error_log /dev/stderr crit;                # upstream error lines would print the address, login included
+
+      # ---- Plain reverse-proxy settings, the same for everything.
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_set_header Accept-Encoding "";      # plain text, so HLS playlists can be read (see sub_filter)
+      proxy_set_header X-Hls-Provider "";       # internal notes of the session memory; never accepted from a player
+      proxy_set_header X-Hls-Renew "";
+      proxy_set_header X-Relay-Provider "";     # internal notes for the relay; never accepted from a player
+      proxy_set_header X-Relay-Uri "";
+      proxy_set_header X-Relay-Orig "";
+      proxy_set_header X-Relay-Port "";
+      proxy_set_header X-Relay-User "";
+      proxy_set_header X-Relay-Pass "";
+      proxy_ssl_server_name on;
+      # Certificates are not checked (nginx's default). Many players do not check
+      # them either, and some providers' servers have expired or self-made ones;
+      # checking here would refuse servers that play fine without the proxy.
+      proxy_buffering off;                      # pass bytes on as they arrive
+      proxy_request_buffering off;
+      proxy_max_temp_file_size 0;
+      proxy_buffer_size 64k;
+      proxy_buffers 8 64k;
+      chunked_transfer_encoding off;            # end streams by closing, like the provider does
+      proxy_connect_timeout 10s;
+      proxy_read_timeout 60s;                   # longest gap between bytes, not stream length
+      send_timeout 60s;
+
+      # ---- 1. Redirects (MPEG-TS, movies, series, catch-up, the guide). A provider
+      # ---- answers "go to that other server". Rewrite the address so the player
+      # ---- comes back to this proxy for it: /__cdn/<scheme>/<host>/...
+      absolute_redirect off;                    # hand the player "/__cdn/..." as is, never "http://this-host/__cdn/..."
+      proxy_redirect ~*^(https?)://([^/]+)(/.*)?$$ /__cdn/$$1/$$2$$3;
+      proxy_redirect ~^//([^/]+)(/.*)?$$ /__cdn/$$pscheme/$$1$$2;   # "//server/path": same http or https as the provider
+
+      # ---- 2. Where a /__cdn/ request really goes, and what it may not reach.
+      map $$request_uri $$cdn_target {
+        default "";
+        ~*^/__cdn/(?<cs>https?)/(?<ch>[^/?]+)(?<cr>/.*)$$  $$cs://$$ch$$cr;
+        ~*^/__cdn/(?<cs>https?)/(?<ch>[^/?]+)$$            $$cs://$$ch/;
+      }
+      map $$request_uri $$cdn_prefix {
+        default "";
+        ~*^(?<cp>/__cdn/https?/[^/?]+)  $$cp;
+      }
+      map $$request_uri $$cdn_scheme {
+        default http;
+        ~*^/__cdn/https/  https;
+      }
+      map $$request_uri $$cdn_forbidden {         # nothing on this machine or this network
+        default 0;
+        "~*^/__cdn/https?/(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|([0-9]+\.)*0[0-9]+(\.[0-9]+)*([:/?]|$$)|\[|[^/]*[@%])"  1;
+      }
+
+      # ---- 2b. /__cdu/: the same as /__cdn/, for one kind of address only: a
+      # ---- "../" line from a live channel's playlist (see $$cdn_up in part 3).
+      # ---- Such an address is /__cdu/<scheme>/<server>, then 32 spare folders
+      # ---- named "__up", then one named "__top", then the playlist's real folder
+      # ---- and the "../" line itself. The player does the climbing. Climbing
+      # ---- inside the real folders leaves the spares alone (first rule below).
+      # ---- Climbing higher than the server's top folder uses up "__top" and then
+      # ---- spares, never the server's name, and what is left is counted from
+      # ---- the top folder (second rule), which is where a player talking to the
+      # ---- server directly ends up too. /__cdn/ itself is not changed in any way.
+      map $$request_uri $$cdu_target {
+        default "";
+        "~*^/__cdu/(?<ua>https?)/(?<ub>[^/?]+)(/__up){32}/__top(?<uc>/.*)$$"  $$ua://$$ub$$uc;
+        "~*^/__cdu/(?<ua>https?)/(?<ub>[^/?]+)(/__up)*(?<uc>/.*)$$"           $$ua://$$ub$$uc;
+      }
+      map $$request_uri $$cdu_server {             # the server alone
+        default "";
+        "~*^/__cdu/(?<ue>https?)/(?<uf>[^/?]+)"  $$ue://$$uf;
+      }
+      map $$request_uri $$cdu_prefix {             # the same server's ordinary /__cdn/ address
+        default "";
+        "~*^/__cdu/(?<ug>https?)/(?<ui>[^/?]+)"  /__cdn/$$ug/$$ui;
+      }
+      map $$request_uri $$cdu_scheme {
+        default http;
+        ~*^/__cdu/https/  https;
+      }
+      map $$request_uri $$cdu_forbidden {         # nothing on this machine or this network (the same list as for /__cdn/)
+        default 0;
+        "~*^/__cdu/https?/(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|([0-9]+\.)*0[0-9]+(\.[0-9]+)*([:/?]|$$)|\[|[^/]*[@%])"  1;
+      }
+      # A few players send ".." as written instead of working it out. Normally
+      # that is passed on untouched and the video server works it out, as it would
+      # without the proxy. Only when such an address climbs higher than the
+      # server's top folder (the spares are no longer all there once nginx has
+      # worked the path out) is nginx's worked-out path used instead.
+      map $$request_uri $$cdu_dots {
+        default 0;
+        "~*^/__cdu/[^?]*/\.\.?(/|\?|$$)"  1;
+      }
+      map $$uri $$cdu_state {
+        default lost;                              # climbed past the spares and the server's name: nothing left to go by
+        "~*^/__cdu/https?/[^/]+(/__up){32}/__top(/|$$)"  intact;
+        "~*^/__cdu/https?/[^/]+(/__up)*/"               over;
+      }
+      map "$$cdu_dots:$$cdu_state" $$cdu_fix {
+        default  ok;
+        "1:over" over;
+        "1:lost" lost;
+      }
+
+      # ---- 3. HLS playlists name their video pieces without a server (or with the
+      # ---- other server's full address). Point those lines back at this proxy too.
+      # http or https of the server the playlist in hand came from (for "//server/path")
+      map "$$cdn|$$pscheme" $$cdn_rel {
+        default            /__cdn/https;
+        ~^/__cdn/http/     /__cdn/http;
+        ~^\|http$$         /__cdn/http;
+      }
+      sub_filter_types application/vnd.apple.mpegurl application/x-mpegurl application/mpegurl audio/mpegurl audio/x-mpegurl;
+      sub_filter_once off;
+      # An address written as "//server/path" means "same http or https as this
+      # playlist, on that other server". These two rules must stay ABOVE the
+      # "/..." rules below: nginx uses the first rule that fits.
+      sub_filter "\n//"           "\n$$sf_rel/";
+      sub_filter 'URI="//'        'URI="$$sf_rel/';
+      sub_filter "\n/"            "\n$$sf_cdn/";
+      sub_filter 'URI="/'         'URI="$$sf_cdn/';
+      sub_filter "\nhttps://"     "\n$$sf_https";
+      sub_filter "\nhttp://"      "\n$$sf_http";
+      sub_filter 'URI="https://'  'URI="$$sf_https';
+      sub_filter 'URI="http://'   'URI="$$sf_http';
+      # An address written as "../folder/file" means "up one folder from this
+      # playlist". A live channel's playlist is handed to the player in a made-up
+      # folder (/__ch/..., see part 4), where "up one folder" leads nowhere. For
+      # those playlists $$cdn_up is the playlist's real folder on its own server,
+      # reached through /__cdu/ (part 2b), followed by "../", so the player does
+      # the climbing on the real address ("../../x" works the same way).
+      # Everywhere else $$cdn_up is just "../" and these two rules change nothing:
+      # a playlist fetched through /__cdn/ or /__cdu/ sits at its real address
+      # already, and its "../" lines are passed on exactly as they are.
+      # Not covered, because nothing is left to go by: a line that climbs more
+      # than 32 folders higher than the server's top folder. Not rewritten, and
+      # so no better than before: "./../x", "folder/../../x" and a bare "..".
+      sub_filter "\n../"          "\n$$sf_up";
+      sub_filter 'URI="../'       'URI="$$sf_up';
+      # ---- Who does this rewriting. A player's request for a playlist is handed to
+      # ---- the relay (part 3b in provider-locations), which reads the playlist
+      # ---- line by line, the way a player does, and so copes with forms these
+      # ---- text rules would miss. The relay asks nginx for the playlist from the
+      # ---- address 127.0.0.2. For that one caller the rules above put back
+      # ---- exactly what they found ($$sf_... below), so the playlist arrives as
+      # ---- the provider wrote it, and three notes say where its addresses lead.
+      # ---- For every other caller the rules work as described: that is what a
+      # ---- player gets if the relay is not running (asked from 127.0.0.3).
+      map $$remote_addr $$pl_raw   { default 0; 127.0.0.2 1; }
+      map $$remote_addr $$pl_inner { default 0; 127.0.0.2 1; 127.0.0.3 1; }
+      map $$pl_raw $$sf_rel   { default $$cdn_rel;       1 "/"; }
+      map $$pl_raw $$sf_cdn   { default $$cdn;           1 ""; }
+      map $$pl_raw $$sf_up    { default $$cdn_up;        1 "../"; }
+      map $$pl_raw $$sf_https { default "/__cdn/https/"; 1 "https://"; }
+      map $$pl_raw $$sf_http  { default "/__cdn/http/";  1 "http://"; }
+      map $$pl_raw $$pl_note_cdn { default ""; 1 $$cdn; }
+      map $$pl_raw $$pl_note_rel { default ""; 1 $$cdn_rel; }
+      map $$pl_raw $$pl_note_up  { default ""; 1 $$cdn_up; }
+      add_header X-Pl-Cdn $$pl_note_cdn;
+      add_header X-Pl-Rel $$pl_note_rel;
+      add_header X-Pl-Up  $$pl_note_up;
+      proxy_hide_header X-Pl-Cdn;               # only nginx writes these notes: a server that sends its own is not believed
+      proxy_hide_header X-Pl-Rel;
+      proxy_hide_header X-Pl-Up;
+      # which requests are playlists a player is asking for
+      map "$$request_method:$$pl_inner:$$uri" $$pl_via {
+        default 0;
+        "~^GET:0:/__ch/.*\.m3u8$$"          1;
+        "~^GET:0:/__c(dn|du)/.*\.m3u8$$"    1;
+      }
+
+      # ---- 4. Live HLS: one provider session per channel.
+      # ---- Many providers start a NEW session every time a channel's address is
+      # ---- asked, and a new session ends the one before it. A player refreshes
+      # ---- that address every few seconds, and several players or a recording may
+      # ---- be on the same channel. So the proxy remembers where the provider sent
+      # ---- a channel and keeps everyone on that session: the pieces keep the same
+      # ---- addresses from one refresh to the next, and nobody ends anyone else's
+      # ---- stream. When the remembered session is gone, it is replaced once.
+      proxy_cache_path /var/cache/nginx/hls levels=1 keys_zone=hls:1m max_size=16m inactive=1m use_temp_path=off;
+
+      server {                                  # the memory itself; reachable only from this container
+        listen 127.0.0.1:8195;
+        access_log off;
+        location = /healthz { return 200; }     # the container's health check
+        location / {
+          set $$cdn "";
+          set $$cdn_up "../";
+          set $$sess "-";                       # (these keep the config valid when no provider is set up)
+          set $$pscheme http;
+          proxy_redirect off;
+          proxy_buffering on;                   # needed to remember an answer; this one is only a redirect
+          proxy_cache hls;
+          proxy_cache_key "$$http_x_hls_provider$$uri";   # the channel address; a query string never names another channel
+          proxy_cache_valid 301 302 303 307 308 365d;  # only the "it is over there" answer is remembered, for as long as the channel is in use
+          proxy_cache_lock on;                  # opens arriving together wait for the first one
+          proxy_cache_lock_timeout 20s;         # ...for as long as a slow provider may take to answer; with a shorter
+          proxy_cache_lock_age 20s;             # wait, the later opens went to the provider too and ended the first session
+          proxy_cache_bypass $$http_x_hls_renew; # asked to replace a session that is gone
+          proxy_ignore_headers Cache-Control Expires Set-Cookie Vary X-Accel-Expires;
+          add_header X-Hls-Sess $$upstream_cache_status always;
+          proxy_pass $$http_x_hls_provider;
+        }
+      }
+
+      # ---- PROVIDERS: one server block per provider is built at start from
+      # ---- .env (see "entrypoint" above) and shares provider-locations below.
+
+  # Shared by every provider block (one per provider in .env).
+  provider-locations:
+    content: |
+      access_log /dev/stdout masked;
+      access_log /var/run/video-servers.seen vs if=$$vs_note;   # see "Video servers" above
+      set $$sess   "-";
+      set $$cdn    "";
+      set $$cdn_up "../";                     # "../" in a playlist stays "../" unless a channel-folder playlist says otherwise (see part 3)
+      set $$chmode "";
+      set $$pbase  "";
+      set $$easy_user "${PLAYER_USER}";       # for the status page, which asks each provider for its account details
+      set $$easy_pass "${PLAYER_PASSWORD}";
+
+      # ---- The address the player asked for. Normally that is the request
+      # ---- itself. A live HLS channel is handed its own folder, /__ch/<the
+      # ---- channel's address>/ (see part 4), so there the channel's address is
+      # ---- taken back out of the request.
+      set $$orig $$request_uri;
+      if ($$request_uri ~ "^(?<rp>[^?]*)(?<rq>\?.*)?$$") { set $$chmode ""; }
+      if ($$request_uri ~ "^/__ch(?<co>/.*?\.m3u8)/(?<cn>[^?]*)(?<cq>\?.*)?$$") { set $$orig $$co; set $$chmode piece; }
+      if ($$request_uri ~ "^/__ch(?<cop>/.*?\.m3u8)/__index\.m3u8(?<cqp>\?.*)?$$") { set $$orig "$$cop$$cqp"; set $$chmode playlist; }
+
+      # ---- 5. One easy login for everything behind this proxy. A request that
+      # ---- logs in as PLAYER_USER is sent on with the provider account of its
+      # ---- port; any other login is passed on untouched (and refused by the provider).
+      # ---- $$up_uri is the address sent to the provider: the player's own address,
+      # ---- byte for byte, with only the login swapped. $$acct_user / $$acct_pass are
+      # ---- already percent-encoded (see "entrypoint"), so any character is safe.
+      set $$up_uri $$orig;
+      # (named pieces, not $$1 $$2: nginx re-encodes numbered ones when the address contains %XX)
+      if ($$orig ~ "^/+(?<pa>live|movie|series|timeshift)/+${PLAYER_USER}/+${PLAYER_PASSWORD}/+(?<pb>.*)$$") { set $$up_uri "/$$pa/$$acct_user/$$acct_pass/$$pb"; }
+      if ($$orig ~ "^/+${PLAYER_USER}/+${PLAYER_PASSWORD}/+(?<pc>[^/?]+(\?.*)?)$$") { set $$up_uri "/$$acct_user/$$acct_pass/$$pc"; }
+      if ($$up_uri ~ "^(?<qa>[^?]*\?(.*&)?)username=${PLAYER_USER}(?<qb>(&.*)?)$$") { set $$up_uri "$${qa}username=$$acct_user$$qb"; }
+      if ($$up_uri ~ "^(?<qc>[^?]*\?(.*&)?)password=${PLAYER_PASSWORD}(?<qd>(&.*)?)$$") { set $$up_uri "$${qc}password=$$acct_pass$$qd"; }
+
+      # ---- 3b. A playlist a player asks for goes to the relay to have its addresses
+      # ---- pointed back at this proxy (see "Who does this rewriting" above). If the
+      # ---- relay is not running, nginx does it itself, as it always has.
+      recursive_error_pages on;                 # so that @pl_relay can step on to @pl_plain
+      error_page 418 = @pl_relay;
+      if ($$pl_via) { return 418; }
+      location @pl_relay {
+        sub_filter_types application/x-nothing;   # the relay's answer is finished: the rules above must not run over it again,
+        chunked_transfer_encoding on;             # and the player's connection stays open for the next refresh
+        proxy_intercept_errors off;
+        proxy_redirect off;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header X-Hls-Provider "";
+        proxy_set_header X-Hls-Renew "";
+        proxy_set_header X-Relay-Orig $$request_uri;
+        proxy_set_header X-Relay-Port $$server_port;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 35s;                   # a little longer than the relay itself waits for a playlist; then nginx does it alone
+        proxy_set_header X-Relay-Provider "";
+        proxy_set_header X-Relay-Uri "";
+        proxy_set_header X-Relay-User "";
+        proxy_set_header X-Relay-Pass "";
+        error_page 502 504 = @pl_plain;
+        set $$pl_to http://127.0.0.1:8197/pl;   # (written this way because nginx wants it so in a named location)
+        proxy_pass $$pl_to;
+      }
+      location @pl_plain {
+        sub_filter_types application/x-nothing;   # rewritten once already, by the request this one hands on to
+        chunked_transfer_encoding on;
+        proxy_intercept_errors off;
+        proxy_redirect off;
+        proxy_set_header Connection "";
+        proxy_set_header Host $$http_host;
+        proxy_set_header X-Hls-Provider "";
+        proxy_set_header X-Hls-Renew "";
+        proxy_bind 127.0.0.3;
+        proxy_pass http://127.0.0.1:$$server_port$$request_uri;
+      }
+      location = /healthz { access_log off; return 200; }
+      location / { proxy_pass $$provider$$up_uri; }
+
+      # The guide and the API are text, often large. Let the provider compress
+      # them if the app asks (as it would directly), and keep the framing that
+      # lets the app notice a download that was cut short.
+      location = /xmltv.php {
+        proxy_read_timeout 300s;
+        chunked_transfer_encoding on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding $$http_accept_encoding;
+        proxy_set_header X-Hls-Provider "";
+        proxy_set_header X-Hls-Renew "";
+        proxy_pass $$provider$$up_uri;
+      }
+      # The provider's lists (channels, movies, series). They give logos and
+      # posters as full addresses, usually on other sites. Those addresses are
+      # pointed back at this proxy, so the player fetches the pictures through
+      # the VPN too. For that the list has to arrive as plain text; it is
+      # compressed again for the app if the app asks.
+      location = /player_api.php {
+        proxy_read_timeout 300s;
+        chunked_transfer_encoding on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header X-Hls-Provider "";
+        proxy_set_header X-Hls-Renew "";
+        gzip on;
+        gzip_types application/json text/plain;
+        gzip_proxied any;
+        gzip_min_length 1024;
+        sub_filter_types *;
+        sub_filter_once off;
+        sub_filter '"https:\/\/' '"http://$$http_host/__cdn/https/';
+        sub_filter '"http:\/\/'  '"http://$$http_host/__cdn/http/';
+        sub_filter '"https://'   '"http://$$http_host/__cdn/https/';
+        sub_filter '"http://'    '"http://$$http_host/__cdn/http/';
+        proxy_pass $$provider$$up_uri;
+      }
+
+      # ---- The status page: what is set up, what is wrong, where the VPN comes out.
+      # ---- Drawn by the relay; the few lines that hand it over are written at start
+      # ---- (see "entrypoint" above).
+      include /etc/nginx/status.inc;
+
+      # ---- 6. Live MPEG-TS: one provider connection per channel here as well.
+      # ---- Part 4 keeps every HLS reader of a channel on one provider session. A
+      # ---- request for a live channel as MPEG-TS (".ts", which many recorders
+      # ---- use) would open another one, and with a provider that allows one per
+      # ---- channel the readers then end each other over and over: the picture
+      # ---- freezes every few seconds and a recording is cut to pieces.
+      # ---- Live ".ts" requests are handed to the relay (the small Python program
+      # ---- beside nginx; its text is at the bottom of this file). What it does
+      # ---- with them is set for each provider by its NAME_LIVE_TV line in .env.
+      # ---- There is no default, because the two choices suit different homes:
+      # ----   ..._LIVE_TV=hls  Your players use HLS. A ".ts" reader is given the
+      # ----                channel's HLS video, joined end to end: the relay
+      # ----                fetches the same playlist and pieces the players get,
+      # ----                from this proxy, so everyone is on one provider
+      # ----                session. Watching and recording a channel at once
+      # ----                works whichever started first. That stream is the HLS
+      # ----                one: a few seconds further behind live than the
+      # ----                provider's MPEG-TS.
+      # ----   ..._LIVE_TV=ts   Your players use MPEG-TS. The first reader of a channel
+      # ----                makes the relay open it at the provider, and every
+      # ----                reader of that channel is given the provider's own
+      # ----                bytes. The provider sees one connection however many
+      # ----                readers there are, one leaving does not disturb the
+      # ----                rest, and the connection is dropped the moment the
+      # ----                last one leaves. The one who opens a channel gets the
+      # ----                stream from its first byte; one who joins is handed the
+      # ----                newest 10 seconds of video at once (worked out from how
+      # ----                fast that channel's video comes), on a whole packet, so
+      # ----                it has something in hand. Opening a channel as
+      # ----                HLS while it is being read as MPEG-TS still ends one
+      # ----                of the two: that is the provider's rule, and turning
+      # ----                MPEG-TS into HLS is beyond this proxy.
+      # ---- One more thing the relay does for MPEG-TS: if the provider ends a
+      # ---- stream while people are watching, the relay asks for it again at once
+      # ---- and carries on, so the players do not each have to notice and ask
+      # ---- again by themselves. (Only for a stream that had run 30 seconds.)
+      # ---- For nginx these are ordinary proxied requests: it passes the bytes on
+      # ---- and, when the player hangs up, closes its connection to the relay,
+      # ---- which is how the relay knows a reader has gone.
+      location ~ "^/+live/+${PLAYER_USER}/+${PLAYER_PASSWORD}/+[^/]+\.ts$$" {
+        proxy_intercept_errors off;
+        proxy_read_timeout 100s;
+        proxy_set_header Connection "";
+        proxy_set_header Range "";                       # a live stream has no ranges
+        proxy_set_header X-Hls-Provider "";
+        proxy_set_header X-Hls-Renew "";
+        proxy_set_header X-Relay-Provider $$provider;    # which provider (the relay accepts only those in .env)
+        proxy_set_header X-Relay-Uri $$up_uri;           # the channel's address there, with the provider's login
+        proxy_set_header X-Relay-Orig $$orig;            # the address as the player sent it
+        proxy_set_header X-Relay-Port $$server_port;
+        proxy_set_header X-Relay-User "";
+        proxy_set_header X-Relay-Pass "";
+        proxy_connect_timeout 2s;
+        error_page 502 = @ts_plain;                      # the relay is not running: the provider directly
+        proxy_pass http://127.0.0.1:8197/$$live_tv;
+      }
+      # the short forms of a live address (no "/live/", with or without ".ts")
+      location ~ "^/+${PLAYER_USER}/+${PLAYER_PASSWORD}/+[0-9]+(\.ts)?$$" {
+        proxy_intercept_errors off;
+        proxy_read_timeout 100s;
+        proxy_set_header Connection "";
+        proxy_set_header Range "";                       # a live stream has no ranges
+        proxy_set_header X-Hls-Provider "";
+        proxy_set_header X-Hls-Renew "";
+        proxy_set_header X-Relay-Provider $$provider;    # which provider (the relay accepts only those in .env)
+        proxy_set_header X-Relay-Uri $$up_uri;           # the channel's address there, with the provider's login
+        proxy_set_header X-Relay-Orig $$orig;            # the address as the player sent it
+        proxy_set_header X-Relay-Port $$server_port;
+        proxy_set_header X-Relay-User "";
+        proxy_set_header X-Relay-Pass "";
+        proxy_connect_timeout 2s;
+        error_page 502 = @ts_plain;                      # the relay is not running: the provider directly
+        proxy_pass http://127.0.0.1:8197/$$live_tv;
+      }
+      location @ts_plain { proxy_pass $$provider$$up_uri; }
+
+      # A provider's ready-made M3U playlist lists every stream at the
+      # provider's own address with the real login, so a player using it would
+      # skip the VPN. Refused on purpose: use the Xtream login instead.
+      location = /get.php { return 403; }
+
+      # (Order matters below: nginx tries these patterns from top to bottom, so the
+      # two for a channel's own folder come before the general ".m3u8" one.)
+
+      # ---- Live HLS, the channel's playlist (the player arrives here from "the start", further down). Fetch the remembered
+      # ---- session's playlist. The player always asks the same address and always
+      # ---- gets the same session.
+      location ~ ^/__ch/.+\.m3u8/__index\.m3u8$$ {
+        chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
+        if ($$chmode != playlist) { return 404; }
+        sub_filter_types *;
+        proxy_redirect off;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header X-Hls-Provider $$provider;
+        proxy_set_header X-Hls-Renew "";
+        error_page 301 302 303 307 308 = @hls;
+        proxy_pass http://127.0.0.1:8195$$up_uri;
+      }
+      location @hls {
+        chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
+        sub_filter_types *;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        proxy_read_timeout 25s;               # long enough for a channel that is slow to start, short enough to replace one that hangs
+        set $$sess $$upstream_http_x_hls_sess;
+        set $$next $$upstream_http_location;
+        if ($$next ~ "^//") { set $$next "$$pscheme:$$next"; }        # "//server/path"
+        if ($$next ~ "^/[^/]") { set $$next "$$provider$$next"; }     # "/some/path" with no server name
+        if ($$next ~* "^https?://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|([0-9]+\.)*0[0-9]+(\.[0-9]+)*([:/?]|$$)|\[|[^/]*[@%])") { return 403; }
+        if ($$next ~* "^(https?)://([^/]+)") { set $$cdn "/__cdn/$$1/$$2"; }
+        if ($$next ~* "^(?<us>https?)://(?<uh>[^/?]+)(?<ud>/([^?]*/)?)") { set $$cdn_up "/__cdu/$$us/$$uh/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__top$$ud../"; }   # the playlist's real folder, for "../" lines
+        error_page 400 401 403 404 410 429 500 502 503 504 509 520 521 522 523 524 = @hls_renew;   # the remembered session is gone
+        proxy_pass $$next;
+      }
+      location @hls_renew {                   # open the channel again, once, and remember the new session
+        chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
+        proxy_redirect off;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header X-Hls-Provider $$provider;
+        proxy_set_header X-Hls-Renew 1;
+        error_page 301 302 303 307 308 = @hls_renewed;
+        proxy_pass http://127.0.0.1:8195$$up_uri;
+      }
+      location @hls_renewed {                 # whatever this one answers goes to the player
+        chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
+        sub_filter_types *;
+        proxy_read_timeout 25s;
+        set $$cdn_up "../";                   # not the folder of the session that was just replaced
+        set $$sess $$upstream_http_x_hls_sess;
+        set $$next $$upstream_http_location;
+        if ($$next ~ "^//") { set $$next "$$pscheme:$$next"; }
+        if ($$next ~ "^/[^/]") { set $$next "$$provider$$next"; }
+        if ($$next ~* "^https?://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|([0-9]+\.)*0[0-9]+(\.[0-9]+)*([:/?]|$$)|\[|[^/]*[@%])") { return 403; }
+        if ($$next ~* "^(https?)://([^/]+)") { set $$cdn "/__cdn/$$1/$$2"; }
+        if ($$next ~* "^(?<us>https?)://(?<uh>[^/?]+)(?<ud>/([^?]*/)?)") { set $$cdn_up "/__cdu/$$us/$$uh/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__top$$ud../"; }   # the playlist's real folder, for "../" lines
+        proxy_pass $$next;
+      }
+
+      # ---- Live HLS, the pieces: anything else asked inside a channel's folder is a
+      # ---- piece (or a further playlist) that the channel's playlist named with
+      # ---- no server and no folder. It lives next to that playlist, so fetch it
+      # ---- from the folder the channel's session is in.
+      location ~ ^/__ch/ {
+        chunked_transfer_encoding on;         # a further playlist in the channel's folder keeps the connection open too (pieces carry their length and are not affected)
+        if ($$chmode != piece) { return 404; }
+        limit_except GET HEAD { deny all; }
+        proxy_redirect off;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header X-Hls-Provider $$provider;
+        proxy_set_header X-Hls-Renew "";
+        error_page 301 302 303 307 308 = @hls_piece;
+        proxy_pass http://127.0.0.1:8195$$up_uri;
+      }
+      location @hls_piece {
+        chunked_transfer_encoding on;
+        set $$sess $$upstream_http_x_hls_sess;
+        set $$next $$upstream_http_location;
+        if ($$next ~ "^//") { set $$next "$$pscheme:$$next"; }
+        if ($$next ~ "^/[^/]") { set $$next "$$provider$$next"; }
+        if ($$next ~* "^https?://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|0\.|([0-9]+\.)*0[0-9]+(\.[0-9]+)*([:/?]|$$)|\[|[^/]*[@%])") { return 403; }
+        set $$pdir "/";
+        if ($$next ~* "^https?://[^/?]+(?<nd>/[^?]*/)") { set $$pdir $$nd; }
+        if ($$next ~* "^(?<ns>https?)://(?<nh>[^/?]+)") { set $$cdn "/__cdn/$$ns/$$nh"; set $$pbase "$$ns://$$nh"; }
+        if ($$pbase = "") { return 502; }
+        set $$cn_dir "";                       # a further playlist in the channel's folder: its own real folder, for "../" lines
+        if ($$cn ~ "^(?<cnf>.*/)[^/]*$$") { set $$cn_dir $$cnf; }
+        set $$cdn_up "/__cdu/$$ns/$$nh/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__up/__top$$pdir$${cn_dir}../";
+        proxy_redirect ~*^(https?)://([^/]+)(/.*)?$$ /__cdn/$$1/$$2$$3;
+        proxy_redirect ~^//([^/]+)(/.*)?$$ /__cdn/$$ns/$$1$$2;
+        proxy_redirect ~^(/[^/].*)$$ $$cdn$$1;
+        proxy_pass $$pbase$$pdir$$cn$$cq;
+      }
+
+      # ---- Live HLS, the start: the channel is opened. Ask the memory where this
+      # ---- channel's session is. If the provider sends the channel to another
+      # ---- server (most do), give the channel a folder of its own on this proxy
+      # ---- and send the player there. A playlist may name its pieces with no
+      # ---- folder at all ("chunk_123.ts"); the player then asks for them inside
+      # ---- that same folder, and "the pieces" above knows which channel they belong to.
+      # ---- If the provider answers with the playlist itself, it is passed on as is.
+      location ~ \.m3u8$$ {
+        chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
+        sub_filter_types *;                   # a playlist is rewritten whatever type the provider labels it
+        proxy_redirect off;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        proxy_set_header Connection "";
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header X-Hls-Provider $$provider;
+        proxy_set_header X-Hls-Renew "";
+        error_page 301 302 303 307 308 = @hls_open;
+        proxy_pass http://127.0.0.1:8195$$up_uri;
+      }
+      location @hls_open {
+        set $$sess $$upstream_http_x_hls_sess;
+        return 302 /__ch$$rp/__index.m3u8$$rq;
+      }
+
+      # Everything a provider pointed at: video pieces, MPEG-TS, movies, the guide.
+      location ^~ /__cdn/ {
+        set $$cdn $$cdn_prefix;
+        set $$cdn_s $$cdn_scheme;
+        if ($$cdn_forbidden) { return 403; }
+        if ($$cdn_target = "") { return 404; }
+        limit_except GET HEAD { deny all; }   # players only ever fetch
+        proxy_redirect ~*^(https?)://([^/]+)(/.*)?$$ /__cdn/$$1/$$2$$3;
+        proxy_redirect ~^//([^/]+)(/.*)?$$ /__cdn/$$cdn_s/$$1$$2;
+        proxy_redirect ~^(/[^/].*)$$ $$cdn$$1;   # "go to /some/path" on the same server
+        proxy_pass $$cdn_target;
+
+        # A playlist fetched from the other server: rewritten whatever type it is labelled.
+        location ~ \.m3u8$$ {
+          chunked_transfer_encoding on;         # a playlist keeps the connection open, as the provider's own server does
+          sub_filter_types *;
+          set $$cdn $$cdn_prefix;
+          set $$cdn_s $$cdn_scheme;
+          if ($$cdn_forbidden) { return 403; }
+          if ($$cdn_target = "") { return 404; }
+          limit_except GET HEAD { deny all; }
+          proxy_pass $$cdn_target;
+        }
+      }
+
+      # A "../" line from a live channel's playlist (see part 2b). The same as
+      # /__cdn/ above in every other way.
+      location ^~ /__cdu/ {
+        set $$cdn $$cdu_prefix;
+        set $$cdn_s $$cdu_scheme;
+        set $$cdu_to $$cdu_target;
+        if ($$cdu_forbidden) { return 403; }
+        if ($$cdu_target = "") { return 404; }
+        limit_except GET HEAD { deny all; }
+        proxy_redirect ~*^(https?)://([^/]+)(/.*)?$$ /__cdn/$$1/$$2$$3;
+        proxy_redirect ~^//([^/]+)(/.*)?$$ /__cdn/$$cdn_s/$$1$$2;
+        proxy_redirect ~^(/[^/].*)$$ $$cdn$$1;
+        if ($$cdu_fix = lost) { return 404; }
+        if ($$cdu_fix = over) { set $$cdu_to $$cdu_server; rewrite "(?i)^/__cdu/https?/[^/]+(/__up)*(?<dn>/.*)$$" $$dn break; }   # ".." as written, climbing too high: nginx's worked-out path, counted from the top folder
+        proxy_pass $$cdu_to;
+
+        location ~ \.m3u8$$ {
+          chunked_transfer_encoding on;
+          sub_filter_types *;
+          set $$cdn $$cdu_prefix;
+          set $$cdn_s $$cdu_scheme;
+          set $$cdu_to $$cdu_target;
+          if ($$cdu_forbidden) { return 403; }
+          if ($$cdu_target = "") { return 404; }
+          limit_except GET HEAD { deny all; }
+          if ($$cdu_fix = lost) { return 404; }
+          if ($$cdu_fix = over) { set $$cdu_to $$cdu_server; rewrite "(?i)^/__cdu/https?/[^/]+(/__up)*(?<dn>/.*)$$" $$dn break; }
+          proxy_pass $$cdu_to;
+        }
+      }
+
+  # The relay (see the "relay" service above). Plain Python, standard library only.
+  relay:
+    content: |
+      # The relay. One small program that does the jobs plain nginx settings cannot:
+      #
+      #   /ts      Share one provider MPEG-TS stream between every reader of a channel.
+      #            The first reader of a channel makes the relay open it at the
+      #            provider; everyone else on that channel is given the same bytes. The
+      #            provider sees one connection however many readers there are. It is
+      #            dropped when the last reader leaves (in a channel's first seconds,
+      #            a moment later: see LINGER).
+      #   /hls     Give a reader that asks for MPEG-TS (many recorders do) the channel's
+      #            HLS video instead, joined end to end, so that it shares the one HLS
+      #            session your players are on and does not open a second one.
+      #   /pl      Point the addresses inside an HLS playlist back at this proxy, so the
+      #            player fetches every piece through the VPN. nginx fetches the
+      #            playlist (and keeps doing all the network work); the relay only
+      #            reads it line by line and rewrites the addresses.
+      #   /status  Draw the status page: what is set up, what is wrong, and where the
+      #            VPN comes out.
+      #
+      # nginx is the only thing that sends it requests (it listens on 127.0.0.1). It
+      # connects to the providers named in .env and the servers they redirect to, to
+      # nginx in this stack, and, for the status page only, to ipinfo.io to learn
+      # where the VPN comes out. It keeps the newest 15 seconds or so of each open channel in memory
+      # (never less than 12 MB of it, never more than 64 MB).
+      import asyncio, html, http, ipaddress, json, os, re, signal, socket, ssl, sys, time
+      from collections import deque
+      from urllib.parse import quote, urlsplit, urljoin
+
+      if sys.version_info < (3, 12):   # older asyncio can lose a cancel inside wait_for and leave a provider connection open
+          raise SystemExit('RELAY: needs Python 3.12 or newer')
+
+      PORT = 8197
+      # A reader that joins a channel already open starts JOIN_SECONDS behind live: it is handed that
+      # much of the newest video at once, so it has something in hand when the provider pauses, as a
+      # player on a connection of its own has from the provider's opening burst. It is counted in
+      # seconds, not megabytes, so it is the same for a small channel and a 4K one: the relay measures
+      # how fast each channel's video really comes (over the last minute) and works the amount out
+      # from that.
+      JOIN_SECONDS = 10
+      # What is kept of each open channel, for readers that join: KEEP_SECONDS of it, and never less
+      # than RING or more than RING_MAX.
+      KEEP_SECONDS = 15
+      RING = 12 * 1024 * 1024
+      RING_MAX = 64 * 1024 * 1024
+      BURST_SECONDS = 2.5           # (the provider's opening burst is measured and noted in the log)
+      # A provider that ends a live stream while people are watching is asked for it again, at once, so
+      # that every player does not have to notice and ask by itself. Only a stream that had been running
+      # for REOPEN_AFTER seconds is asked for again.
+      REOPEN_AFTER = 30
+      REOPEN_WAIT = 5               # seconds a provider has to answer when asked again (and twice that to send video)
+      DROP_GAP = 0.1                # seconds a provider is given to see a hang-up before another channel is asked for
+      # A player that is tuning opens a channel, hangs up and asks again within a moment. So a channel is
+      # kept for LINGER after its last reader leaves, in its first seconds only; a request for any OTHER
+      # channel of that provider drops it at once.
+      LINGER = 0.4
+      READERS_MAX = 100             # readers the relay serves at once, all channels together
+      # A reader that cannot keep up is disconnected, so that what is held for it stays small: when it
+      # has been more than BEHIND bytes behind its channel for BEHIND_SECONDS, or FAR_BEHIND at any moment.
+      # (This is also about how long a paused player is waited for. A reader that has just joined is
+      # allowed what it was handed on top, until it has taken it.)
+      BEHIND = 16 * 1024 * 1024
+      BEHIND_SECONDS = 15
+      FAR_BEHIND = 64 * 1024 * 1024
+      CONNECT_WAIT = 10             # seconds for a server to accept a connection
+      HEADER_WAIT = 20              # seconds for a server to send each line of its answer's heading
+      PLAYLIST_WAIT = 30            # the same for a playlist asked of nginx: longer than nginx's own wait for the provider
+      START_WAIT = 60               # seconds a reader waits for a channel's first video
+      QUIET_WAIT = 60               # seconds a stream may send nothing before it is given up on
+      HEADER_LINES = 100            # an answer's heading may not be longer than this
+      # Where a provider's redirect may not lead: this machine, and home and private networks.
+      PRIVATE = [ipaddress.ip_network(n) for n in (
+          '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12',
+          '192.168.0.0/16', '::/127', 'fc00::/7', 'fe80::/10')]
+
+      def say(msg):                 # the relay's log lines never hold an address or a login
+          print('RELAY: ' + msg, flush=True)
+
+      # The providers this relay may connect to: the addresses nginx was given (see the service's
+      # "command" in the compose file, which passes on those and nothing else from .env).
+      PROVIDERS = set(u.rstrip('/') for u in os.environ.get('RELAY_PROVIDERS', '').split() if u.lower().startswith(('http://', 'https://')))
+
+      TLS = ssl.create_default_context()
+      TLS.check_hostname = False    # certificates are not checked, the same as in nginx (see the notes there)
+      TLS.verify_mode = ssl.CERT_NONE
+      CHECKED = ssl.create_default_context()   # for the status page's one lookup outside (where the VPN comes out)
+
+      # ---------------------------------------------------------------------------
+      # A plain HTTP request, with the answer's body given back piece by piece.
+      # ---------------------------------------------------------------------------
+      class Heading(dict):
+          """An answer's heading: by name (lower case, last one wins) and, in .all, every line as it came."""
+          def __init__(self):
+              super().__init__()
+              self.all = []
+
+      class Refused(Exception):
+          """The other side said no (or did not answer properly). Carries what to tell the reader."""
+          def __init__(self, status, kind='', text=b''):
+              self.status, self.kind, self.text = status, kind, text
+
+      def private(address):
+          ip = ipaddress.ip_address(address.split('%')[0])
+          if ip.version == 6 and ip.ipv4_mapped:
+              ip = ip.ipv4_mapped
+          return any(ip in net for net in PRIVATE if net.version == ip.version)
+
+      async def fetch(url, agent, hops=0, guard=True, tls=None, source=None, follow=True, stay=False, wait=HEADER_WAIT):
+          """Open url. Returns (status, headers, reader, writer); follows redirects."""
+          u = urlsplit(url)
+          secure = u.scheme == 'https'
+          host, port = u.hostname or '', u.port or (443 if secure else 80)
+          if u.scheme not in ('http', 'https') or not host or '@' in u.netloc:
+              raise Refused(502)
+          # The name is looked up here, and the connection goes to the very address that was checked.
+          # (An address written as numbers needs no looking up.)
+          try:
+              address = str(ipaddress.ip_address(host))
+          except ValueError:
+              found = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM), CONNECT_WAIT)
+              address = found[0][4][0]
+          if guard and hops and private(address):
+              raise Refused(403)    # a redirect may not lead to this machine or to a home network
+          r, w = await asyncio.wait_for(asyncio.open_connection(
+              address, port, ssl=(tls or TLS) if secure else None, server_hostname=host if secure else None, limit=65536,
+              local_addr=(source, 0) if source else None), CONNECT_WAIT)
+          try:
+              path = (u.path or '/') + ('?' + u.query if u.query else '')
+              if isinstance(agent, str):                # the relay's own fetches: just a name. A channel carries the player's own headers.
+                  agent = ([('User-Agent', agent)] if agent else []) + [('Accept', '*/*')]
+              lines = ['GET %s HTTP/1.1' % path, 'Host: %s' % u.netloc] + ['%s: %s' % nv for nv in agent] + ['Connection: close', '', '']
+              w.write('\r\n'.join(lines).encode('latin-1', 'replace'))
+              await w.drain()
+              line = (await asyncio.wait_for(r.readline(), wait)).decode('latin-1').split()
+              status = int(line[1]) if len(line) > 1 and line[1].isdigit() else 502
+              headers = Heading()
+              for _ in range(HEADER_LINES + 1):
+                  h = (await asyncio.wait_for(r.readline(), wait)).decode('latin-1')
+                  if h in ('\r\n', '\n', ''):
+                      break
+                  name, _, value = h.partition(':')
+                  headers[name.strip().lower()] = value.strip()
+                  headers.all.append((name.strip(), value.strip()))
+              else:
+                  raise Refused(502)
+              if follow and status in (301, 302, 303, 307, 308) and headers.get('location') and hops < 10:
+                  shut(w)
+                  onward = urljoin(url, headers['location'])
+                  if stay and urlsplit(onward).netloc != u.netloc:
+                      raise Refused(502)                # (a fetch from nginx in this stack is never sent elsewhere)
+                  return await fetch(onward, agent, hops + 1, guard, tls, None, True, stay, wait)
+              return status, headers, r, w
+          except ValueError:        # a line far too long to be an answer's heading
+              shut(w)
+              raise Refused(502)
+          except BaseException:
+              shut(w)
+              raise
+
+      def shut(w):
+          try:
+              w.transport.abort()   # at once: the provider's line must be free before the next channel is asked for
+          except Exception:
+              pass
+
+      async def body(r, headers, wait=QUIET_WAIT):
+          """The pieces of an answer's body, whichever way the server marks its end.
+          A body that stops short of its stated length is an error, not an ending."""
+          if 'chunked' in headers.get('transfer-encoding', '').lower():
+              while True:
+                  size = int((await asyncio.wait_for(r.readline(), wait)).split(b';')[0].strip() or b'-1', 16)
+                  if size == 0:
+                      return
+                  if size < 0:
+                      raise OSError('not a chunk size')
+                  while size:
+                      data = await asyncio.wait_for(r.read(min(size, 65536)), wait)
+                      if not data:
+                          raise OSError('the answer stopped short')
+                      size -= len(data)
+                      yield data
+                  await asyncio.wait_for(r.readline(), wait)
+          left = int(headers['content-length']) if headers.get('content-length', '').isdigit() else None
+          while left is None or left > 0:
+              data = await asyncio.wait_for(r.read(65536 if left is None else min(left, 65536)), wait)
+              if not data:
+                  if left:
+                      raise OSError('the answer stopped short')
+                  return
+              if left is not None:
+                  left -= len(data)
+              yield data
+
+      async def get(url, agent, limit=64 * 1024 * 1024):
+          """A whole small answer (a playlist, one video piece). Returns (status, bytes)."""
+          status, headers, r, w = await fetch(url, agent, guard=False, stay=True)
+          try:
+              out, n = [], 0
+              async for data in body(r, headers, HEADER_WAIT):
+                  out.append(data)
+                  n += len(data)
+                  if n > limit:
+                      raise OSError('too large')
+              return status, b''.join(out)
+          finally:
+              shut(w)
+
+      # ---------------------------------------------------------------------------
+      # A channel: one source of video, any number of readers.
+      # ---------------------------------------------------------------------------
+      def clean_start(buf):
+          """Where a new reader can start cleanly in MPEG-TS: at a program table (PAT) if one is near,
+          or else at the first whole packet. 0 if it does not look like MPEG-TS."""
+          end = len(buf) - 376
+          i = buf.find(b'\x47')
+          tries = 0
+          while 0 <= i < end and tries < 2000:
+              if buf[i + 188] == 0x47 and buf[i + 376] == 0x47:
+                  for k in range(i, min(end, i + 188 * 3000), 188):
+                      if buf[k] != 0x47:
+                          break
+                      if (buf[k + 1] & 0x1f) == 0 and buf[k + 2] == 0:
+                          return k
+                  return i
+              i = buf.find(b'\x47', i + 1)
+              tries += 1
+          return 0
+
+      class Reader:
+          def __init__(self):
+              self.q, self.n, self.wake, self.over, self.behind, self.w = deque(), 0, asyncio.Event(), False, None, None
+              self.given = 0                             # what it was handed at once when it joined
+          def push(self, data):
+              self.q.append(data)
+              self.n += len(data)
+              self.wake.set()
+          def end(self, drop=False):
+              if drop:              # nothing more is sent to it, not even what was waiting, and its connection is closed
+                  self.q.clear()
+                  self.n = 0
+                  if self.w is not None:
+                      shut(self.w)
+              self.over = True
+              self.wake.set()
+
+      class Channel:
+          def __init__(self, key, source, provider):
+              self.key, self.provider, self.readers = key, provider, set()
+              self.timer = None                          # the linger, when one is running
+              self.ring, self.kept = deque(), 0          # (time, bytes) of the newest video
+              self.status, self.ready = None, asyncio.Event()   # 200 once video flows, or the refusal
+              self.refusal, self.done = None, False
+              self.total, self.marks = 0, deque()        # every byte the provider has sent, and (time, total) once a second for a minute
+              self.born, self.burst = None, 0        # when the first video came, and how much the provider sent at once then
+              self.asked = time.monotonic()
+              self.task = asyncio.ensure_future(self.run(source))
+              say('a channel was opened (%d open now)' % (len(CHANNELS) + 1))
+
+          async def run(self, source):
+              gen = source(self)
+              try:
+                  async for data in gen:
+                      if self.done:
+                          break
+                      self.feed(data)
+                  if self.status is None:
+                      self.status = 502
+              except Refused as e:
+                  if self.status is None:
+                      self.status, self.refusal = e.status, e
+              except asyncio.CancelledError:
+                  raise
+              except asyncio.TimeoutError:
+                  if self.status is None:
+                      self.status = 504
+                  say('a channel sent nothing for too long and was closed')
+              except Exception as e:
+                  if self.status is None:
+                      self.status = 502
+                  say('a channel ended: ' + type(e).__name__)
+              finally:
+                  try:
+                      await gen.aclose()                # the provider's connection is closed here whatever happened
+                  except BaseException:
+                      pass
+                  self.done = True
+                  LAST_DROP[self.provider] = time.monotonic()
+                  if CHANNELS.get(self.key) is self:
+                      del CHANNELS[self.key]
+                  say('a channel was closed (%d open now)' % len(CHANNELS))
+                  self.ready.set()
+                  for rd in self.readers:
+                      rd.end()
+
+          def feed(self, data):
+              if self.status is None:
+                  self.status = 200
+                  self.ready.set()
+              now = time.monotonic()
+              if self.born is None:
+                  self.born = now
+                  say('a channel gave its first video %.1f s after it was asked for' % (now - self.asked))
+              self.total += len(data)
+              if not self.marks or now - self.marks[-1][0] >= 1:
+                  self.marks.append((now, self.total))
+                  while now - self.marks[0][0] > 60:
+                      self.marks.popleft()
+              if self.ring and now - self.ring[-1][0] > 4:
+                  say('a provider sent nothing for %.0f s, then carried on' % (now - self.ring[-1][0]))
+              if now - self.born < BURST_SECONDS:
+                  self.burst += len(data)
+              elif self.burst >= 0:
+                  say('its opening burst was %d KB' % (self.burst // 1024))
+                  self.burst = -self.burst               # (kept as a minus number once it has been measured and noted)
+              self.ring.append((now, data))
+              self.kept += len(data)
+              speed = self.speed(now)
+              keep = RING if speed is None else min(max(RING, int(speed * KEEP_SECONDS)), RING_MAX)
+              while self.kept - len(self.ring[0][1]) >= keep:
+                  self.kept -= len(self.ring.popleft()[1])
+              for rd in list(self.readers):
+                  if rd.n <= BEHIND + rd.given:           # (what a joiner was handed at the start is not "falling behind")
+                      rd.behind = None
+                  elif rd.behind is None:
+                      rd.behind = now
+                  if rd.n > FAR_BEHIND + rd.given or (rd.behind is not None and now - rd.behind > BEHIND_SECONDS):
+                      # it cannot keep up; holding more for it would only use memory
+                      say('a reader was too slow to keep up with its channel and was disconnected')
+                      rd.end(drop=True)
+                      self.readers.discard(rd)
+                      self.drop_if_empty()
+                  else:
+                      rd.push(data)
+
+          def speed(self, now):
+              """Bytes of video a second; None in a channel's first seconds. It is measured over the last
+              minute and over the last 15 seconds, and the larger is used, so that a channel whose bit
+              rate has just gone up is not short-changed. A feed that has stopped is measured up to its
+              last video, not up to now."""
+              if len(self.marks) < 2 or now - self.marks[0][0] < 8:
+                  return None
+              end = now if now - self.ring[-1][0] < 15 else self.ring[-1][0]
+              best = 0.0
+              for at, total in (self.marks[0], next((m for m in reversed(self.marks) if end - m[0] >= 15), self.marks[0])):
+                  if end - at >= 8:
+                      best = max(best, (self.total - total) / (end - at))
+              return best or None
+
+          def join(self, first):
+              """A new reader. The one who opens a channel gets it from its first byte; one who joins
+              starts with the newest JOIN_SECONDS of video (see there), on a whole packet."""
+              if self.timer is not None:                 # somebody is here after all: the linger is off
+                  self.timer.cancel()
+                  self.timer = None
+              rd = Reader()
+              if first:
+                  for _, data in self.ring:
+                      rd.push(data)
+              elif self.ring:
+                  speed = self.speed(time.monotonic())
+                  want = self.kept if speed is None else int(speed * JOIN_SECONDS)   # (a channel just opened: all of it)
+                  take, size, oldest = [], 0, self.ring[-1][0] - 2 * JOIN_SECONDS
+                  for t, data in reversed(self.ring):
+                      if size and (size + len(data) > want or t < oldest):   # (never more than 20 s of arrivals, whatever the speed says)
+                          break
+                      take.append(data)
+                      size += len(data)
+                  take.reverse()
+                  head, n = b'', 0                      # only the beginning is copied, to find a clean place to start
+                  while n < len(take) and len(head) < 262144:
+                      head += take[n]
+                      n += 1
+                  if head:
+                      rd.push(head[clean_start(head):])
+                  for data in take[n:]:
+                      rd.push(data)
+                  rd.given = rd.n
+                  say('a reader joined a channel and was given %d KB to start%s' % (rd.n // 1024, '' if speed is None else ' (%d s at %d KB a second)' % (JOIN_SECONDS, speed // 1024)))
+              self.readers.add(rd)
+              return rd
+
+          def leave(self, rd):
+              self.readers.discard(rd)
+              if not self.readers and not self.done:   # the last one out
+                  now, opened = time.monotonic(), LAST_OPEN.get(self.provider, (0, ''))
+                  tuning = self.born is None or now - self.born < 5            # a player tunes in a channel's first seconds
+                  moved = now - opened[0] < 1.0 and opened[1] != self.key      # the player has just gone to another channel
+                  if tuning and not moved:
+                      if self.timer is not None:
+                          self.timer.cancel()
+                      self.timer = asyncio.get_running_loop().call_later(LINGER, self.drop_if_empty)   # see LINGER
+                  else:
+                      self.drop()
+
+          def drop_if_empty(self):
+              if not self.readers:
+                  self.drop()
+
+          def drop(self):                              # let go of the provider's stream now
+              if self.timer is not None:
+                  self.timer.cancel()
+                  self.timer = None
+              if not self.done:
+                  self.task.cancel()
+                  self.done = True
+                  LAST_DROP[self.provider] = time.monotonic()
+                  if CHANNELS.get(self.key) is self:
+                      del CHANNELS[self.key]
+
+      CHANNELS = {}
+      LAST_DROP = {}                                   # for each provider: when one of its streams was last let go
+      LAST_OPEN = {}                                   # for each provider: when a channel was last opened, and which
+
+      # ---- where a /ts channel's video comes from: the provider's own MPEG-TS stream
+      def ts_source(target, agent):
+          async def source(ch):
+              again, sent, quiet = 0, 0, 0
+              while True:
+                  began, got, timed = time.monotonic(), False, False
+                  # (asked for again, a provider gets a short while to answer and to send video: readers are waiting)
+                  status, headers, r, w = await fetch(target, agent, wait=REOPEN_WAIT if again else HEADER_WAIT)
+                  try:
+                      if status not in (200, 206):
+                          say('a provider answered %d when asked for a channel' % status)
+                          text = b''
+                          try:      # what the provider said, to pass on to the player
+                              async for data in body(r, headers, 5):
+                                  text += data
+                                  if len(text) > 65536:
+                                      break
+                          except (OSError, asyncio.TimeoutError):
+                              pass
+                          raise Refused(status, headers.get('content-type', ''), text[:65536])
+                      head = b'' if again else None     # a stream opened again is joined on at a whole packet
+                      pieces, started = body(r, headers).__aiter__(), False
+                      while True:
+                          try:
+                              if again and not started:
+                                  data = await asyncio.wait_for(pieces.__anext__(), 2 * REOPEN_WAIT)
+                              else:
+                                  data = await pieces.__anext__()
+                          except StopAsyncIteration:
+                              data = b''
+                          started = True
+                          if head is not None:
+                              head += data
+                              if data and len(head) < 16384:
+                                  continue
+                              data, head = head[clean_start(head):], None
+                              if data and sent % 188:   # the old stream stopped part-way through a packet: fill it out,
+                                  fill = b'\xff' * (188 - sent % 188)   # so the new stream's packets line up with the old
+                                  sent += len(fill)
+                                  yield fill
+                          if not data:
+                              break
+                          got = True
+                          sent += len(data)
+                          yield data
+                  except (OSError, asyncio.TimeoutError) as e:
+                      if not got:
+                          raise
+                      timed = isinstance(e, asyncio.TimeoutError)
+                  finally:
+                      shut(w)
+                  # The provider ended the stream. If anyone is still watching, ask for it again.
+                  # Not for a stream that ended within REOPEN_AFTER seconds (a short clip, a refusal dressed
+                  # up as video), and not when another channel of this provider was opened in the last 15
+                  # seconds: on a one-connection account that is why this one ended, and asking again would
+                  # end the other.
+                  ran, opened = time.monotonic() - began, LAST_OPEN.get(ch.provider, (0, ''))
+                  # A stream that sent under REOPEN_AFTER seconds of video and then went silent, twice in a row:
+                  # the channel is dead, so the readers are let go and the provider is not asked again.
+                  quiet = quiet + 1 if timed and ran < QUIET_WAIT + REOPEN_AFTER else 0
+                  if quiet >= 2:
+                      say('a channel went silent twice in a row; letting its readers go')
+                      return
+                  if not got or not ch.readers or ran < REOPEN_AFTER or (opened[0] > max(began, time.monotonic() - 15) and opened[1] != ch.key):
+                      return
+                  again = 1
+                  say('a provider ended a channel that was being watched; asking for it again')
+                  await asyncio.sleep(DROP_GAP)
+          return source
+
+      # ---- where a /hls channel's video comes from: the channel's HLS pieces, one after another.
+      # Everything is fetched from nginx in this stack, at the same addresses the players use, so the
+      # reader shares the players' one provider session (see "session memory" in the nginx notes).
+      class NotHls(Exception):
+          pass
+
+      def read_playlist(text):
+          if '#EXTM3U' not in text:
+              raise NotHls()
+          seq, target, pieces, variants, rate, ended = 0, 4.0, [], [], None, False
+          for line in text.splitlines():
+              line = line.strip()
+              if line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
+                  seq = int(re.sub(r'\D', '', line[22:]) or 0)
+              elif line.startswith('#EXT-X-TARGETDURATION:'):
+                  target = float(re.sub(r'[^0-9.]', '', line[22:]) or 4)
+              elif line.startswith('#EXT-X-STREAM-INF'):
+                  m = re.search(r'[:,]BANDWIDTH=(\d+)', line)
+                  rate = int(m.group(1)) if m else 0
+              elif line.startswith('#EXT-X-ENDLIST'):
+                  ended = True
+              elif line.startswith(('#EXT-X-MAP', '#EXT-X-BYTERANGE')) or (line.startswith('#EXT-X-KEY') and 'METHOD=NONE' not in line):
+                  raise NotHls()                        # locked, or not whole MPEG-TS files: cannot be joined end to end
+              elif line and not line.startswith('#'):
+                  if rate is not None:
+                      variants.append((rate, line))
+                      rate = None
+                  else:
+                      pieces.append(line)
+          best = max(variants, key=lambda v: v[0])[1] if variants else None   # the best quality on offer
+          return seq, target, pieces, best, ended
+
+      def hls_source(start, agent):
+          home = urlsplit(start).netloc
+          def inside(url):                              # the playlist's addresses must all be this proxy's own
+              if urlsplit(url).netloc != home:
+                  raise NotHls()
+              return url
+          def name(url):
+              return urlsplit(url).path
+
+          async def look():
+              # Always from the channel's own address, so the session memory is kept alive. (For a channel
+              # offered as a list of qualities that is two requests a look where a player makes one.)
+              url = start
+              for _ in range(4):
+                  status, data = await get(url, agent, 2 * 1024 * 1024)
+                  if status != 200:
+                      raise Refused(status)
+                  seq, target, pieces, variant, ended = read_playlist(data.decode('utf-8', 'replace'))
+                  if not variant:
+                      return url, seq, target, pieces, ended
+                  url = inside(urljoin(url, variant))
+              raise NotHls()
+
+          async def source(ch):
+              last, misses, lost, sent, fresh = None, 0, 0, deque(maxlen=60), time.monotonic()
+              while True:
+                  try:
+                      url, seq, target, pieces, ended = await look()
+                      misses = 0
+                  except (NotHls, Refused, OSError, ValueError, asyncio.TimeoutError) as e:
+                      # no playlist this time (a refusal, an error page, a playlist that cannot be joined
+                      # end to end): ask again, as a player would
+                      misses += 1
+                      refused = e.status if isinstance(e, Refused) else 0
+                      if misses > (8 if last is not None else 3):   # the playlist could not be had: 4 tries at the start, 9 once playing
+                          raise Refused(refused or 502)
+                      await asyncio.sleep(2 if last is not None else 1)
+                      continue
+                  top = seq + len(pieces) - 1
+                  afresh = last is not None and (top < last or seq > last + 1)
+                  if last is None or afresh:
+                      last = max(seq - 1, top - 3)      # joining, or the numbering started afresh: start near the newest video
+                  new = [(seq + i, p) for i, p in enumerate(pieces) if seq + i > last]
+                  for number, piece in new:
+                      last = number
+                      try:
+                          address = inside(urljoin(url, piece))
+                      except NotHls:                    # a line that does not lead back to this proxy: not fetched
+                          lost += 1
+                          continue
+                      if afresh and name(address) in sent:   # already passed on, under its old number
+                          continue
+                      data = None
+                      for _ in range(2):
+                          try:
+                              status, data = await get(address, agent)
+                              if status == 200 and data:
+                                  break
+                              data = None
+                          except (OSError, ValueError, asyncio.TimeoutError):
+                              data = None
+                      if data is None:
+                          lost += 1
+                          say('a piece of video could not be fetched and is missing from a stream')
+                          if lost >= 3:
+                              raise Refused(502)
+                          continue
+                      lost = 0
+                      sent.append(name(address))
+                      fresh = time.monotonic()
+                      for i in range(0, len(data), 65536):
+                          yield data[i:i + 65536]
+                  if not new and (ended or time.monotonic() - fresh > max(30, 6 * target)):
+                      return                            # the channel's playlist has finished, or stopped moving
+                  # ask again at the pace a player would
+                  await asyncio.sleep(max(0.5, target if new else target / 2))
+          return source
+
+      # ---------------------------------------------------------------------------
+      # Requests from nginx
+      # ---------------------------------------------------------------------------
+      # What a player sent that is not passed on to the provider: what belongs to one connection, and this proxy's own notes.
+      SKIP = re.compile(r'^(host|connection|keep-alive|proxy-.*|te|trailer|transfer-encoding|upgrade|content-length'
+                        r'|range|if-range|accept-encoding|x-relay-.*|x-hls-.*|x-real-ip|x-forwarded-.*)$$', re.I)
+      HEAD_OK = b'HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\n'
+      OPEN = set()                                      # every connection from nginx that is open now
+
+      def answer(w, status, text=b'', kind='text/plain', more=''):
+          try:
+              reason = http.HTTPStatus(status).phrase
+          except ValueError:
+              reason = 'Error'
+          if isinstance(text, str):
+              text = text.encode()
+          w.write(('HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n%sConnection: close\r\n\r\n'
+                   % (status, reason, kind or 'text/plain', len(text), more)).encode('latin-1', 'replace') + text)
+
+      def channel_key(path, provider, uri):
+          """One channel has one name here, whichever form of its address a player uses
+          (/live/user/pass/1.ts, /user/pass/1.ts, /user/pass/1)."""
+          parts = [p for p in uri.split('?')[0].split('/') if p]
+          if parts and parts[0] == 'live':
+              parts = parts[1:]
+          if parts and parts[-1].endswith('.ts'):
+              parts[-1] = parts[-1][:-3]
+          return path + ' ' + provider + ' ' + '/'.join(parts)
+
+      # ---------------------------------------------------------------------------
+      # HLS playlists: every address in one is pointed back at this proxy
+      # ---------------------------------------------------------------------------
+      # nginx fetches the playlist from the provider exactly as before (same session, same connections).
+      # Asked from the address RAW below, it hands the playlist over as the provider wrote it, with three
+      # notes saying where this playlist's addresses lead:
+      #   X-Pl-Cdn   this proxy's address for the server the playlist came from     (for "/path")
+      #   X-Pl-Rel   the same, for an address written without http or https         (for "//server/path")
+      #   X-Pl-Up    this proxy's address for the playlist's own folder, one level up (for "../path")
+      # A full address (http://server/path) needs no note. An address with none of these beginnings is
+      # next to the playlist itself and is left as it is.
+      RAW = '127.0.0.2'
+      URI_IN_TAG = re.compile(r'(URI=")([^"]*)(")', re.I)
+
+      def rewrite_playlist(text, cdn, rel, up):
+          def move(u):
+              start = u[:8].lower()
+              if start.startswith('https://'):
+                  return '/__cdn/https/' + u[8:]
+              if start.startswith('http://'):
+                  return '/__cdn/http/' + u[7:]
+              if u.startswith('//'):
+                  return rel + '/' + u[2:]
+              if u.startswith('/'):
+                  return cdn + u
+              if u.startswith('../'):
+                  return up + u[3:]
+              return u
+          def in_tags(line):
+              return URI_IN_TAG.sub(lambda m: m.group(1) + move(m.group(2)) + m.group(3), line)
+          out = []
+          for number, line in enumerate(text.split('\n')):
+              core = line.lstrip(' \t')
+              if number == 0 or not core.strip():
+                  out.append(line)
+              elif core.startswith('#'):                # a tag: addresses sit in URI="..."
+                  out.append(in_tags(line))
+              else:                                     # a line that is an address
+                  moved = move(core)
+                  out.append(in_tags(moved if moved != core else line))   # (a line that is not moved is left exactly as it was)
+          return '\n'.join(out)
+
+      # What is passed between player and server on a playlist, either way: everything except what belongs
+      # to one connection and this proxy's own notes.
+      PL_SKIP = re.compile(r'^(host|connection|keep-alive|proxy-.*|te|trailer|transfer-encoding|upgrade|content-length'
+                           r'|range|if-range|content-range|accept-ranges|x-accel-.*|server|date|x-relay-.*|x-hls-.*|x-pl-.*)$$', re.I)
+      HLS_SEEN = {}                                     # channels whose playlist a player has just asked for (for the status page)
+
+      async def playlist(w, h, raw):
+          port, orig = h.get('x-relay-port', ''), h.get('x-relay-orig', '')
+          if not port.isdigit() or not orig.startswith('/'):
+              return answer(w, 400)
+          asked = [nv for nv in raw if not PL_SKIP.match(nv[0])]
+          status, headers, r, up = await fetch('http://127.0.0.1:%s%s' % (port, orig), asked, guard=False, source=RAW, follow=False, wait=PLAYLIST_WAIT)
+          if headers.get('content-encoding', '').strip().lower() not in ('', 'identity'):
+              shut(up)
+              raise OSError('compressed')               # it cannot be read here: with no answer from here, nginx serves it by its own rules
+          try:
+              data = b''
+              async for piece in body(r, headers, PLAYLIST_WAIT):
+                  data += piece
+                  # Not a playlist after all (some providers serve other things at a playlist's address), or
+                  # too big to be handled here: step aside. With no answer from here, nginx serves it itself.
+                  if len(data) > 1024 * 1024 or (status == 200 and len(data) >= 1024 and b'#EXTM' not in data[:1024]):
+                      raise OSError('not a playlist for the relay')
+          finally:
+              shut(up)
+          if b'#EXTM' in data[:1024]:
+              if data.count(b'\n') > 20000:
+                  raise OSError('too many lines')
+              # latin-1 both ways, so every byte outside an address comes out as it went in
+              text = rewrite_playlist(data.decode('latin-1'), headers.get('x-pl-cdn', ''), headers.get('x-pl-rel', '/__cdn/https'),
+                                      headers.get('x-pl-up', '../'))
+              if status == 200:
+                  m = re.match(r'^/__ch(/.+?\.m3u8)/', orig)
+                  if m:
+                      HLS_SEEN[port + m.group(1)] = time.monotonic()
+                      if len(HLS_SEEN) > 300:
+                          for k in [k for k, t in HLS_SEEN.items() if time.monotonic() - t > 30]:
+                              del HLS_SEEN[k]
+              data = text.encode('latin-1')
+          try:
+              reason = http.HTTPStatus(status).phrase
+          except ValueError:
+              reason = 'Status'
+          lines = ['HTTP/1.1 %d %s' % (status, reason)] + ['%s: %s' % nv for nv in headers.all if not PL_SKIP.match(nv[0])]
+          lines += ['Content-Length: %d' % len(data), 'Connection: close', '', '']
+          w.write('\r\n'.join(lines).encode('latin-1', 'replace') + data)
+
+      # ---------------------------------------------------------------------------
+      # The status page
+      # ---------------------------------------------------------------------------
+      KEPT = {}                                         # answers from outside, kept for a while so the page is quick
+
+      ASKING = {}                                       # lookups under way, so that many page views share one
+
+      async def kept(name, seconds, make):
+          """make()'s answer, asked for at most once every `seconds`; None if it takes too long or fails."""
+          had = KEPT.get(name)
+          if had and time.monotonic() - had[0] < (seconds if had[1] is not None else 60):
+              return had[1]
+          async def ask():
+              try:
+                  value = await asyncio.wait_for(make(), 6)
+              except Exception:
+                  value = None
+              KEPT[name] = (time.monotonic(), value)
+              return value
+          if name not in ASKING:
+              ASKING[name] = asyncio.ensure_future(ask())
+              ASKING[name].add_done_callback(lambda f: ASKING.pop(name, None))
+          return await asyncio.shield(ASKING[name])
+
+      async def where_am_i():                           # what the internet sees: asked through the VPN
+          async def ask():
+              status, headers, r, w = await fetch('https://ipinfo.io/json', 'curl/8', guard=False, tls=CHECKED)
+              try:
+                  text = b''
+                  async for data in body(r, headers, 6):
+                      text += data
+                  return json.loads(text) if status == 200 else None
+              finally:
+                  shut(w)
+          return await kept('where', 300, ask)
+
+      async def account(port, user, password):          # the provider's own account page, asked through nginx with the easy login
+          async def ask():
+              url = 'http://127.0.0.1:%s/player_api.php?username=%s&password=%s' % (port, quote(user, safe=''), quote(password, safe=''))
+              status, data = await get(url, '', 1 << 20)
+              if status == 502:                         # most often a name lookup that failed for a moment: asked once more
+                  await asyncio.sleep(0.5)
+                  status, data = await get(url, '', 1 << 20)
+              if status != 200:
+                  return {'answer': status}
+              info = json.loads(data).get('user_info') or {}
+              return {'answer': 200, 'status': info.get('status'), 'auth': info.get('auth'), 'exp': info.get('exp_date'),
+                      'used': info.get('active_cons'), 'max': info.get('max_connections')}
+          # The account page is asked for when somebody looks at the status page, at most once every
+          # ACCOUNT_EVERY seconds, and the page waits a few seconds for the answer, so that what it shows
+          # (connections in use, above all) is how things are now. If the provider is slow for a moment the
+          # last good answer is shown instead, with its age beside it, and not "no answer". After a failure
+          # the provider is asked less and less often (2, 4, 8, at most 15 minutes), so that a provider in
+          # trouble is left alone.
+          st = ACCOUNTS.setdefault(port, {'good': None, 'at': 0.0, 'tried': -1e9, 'fails': 0, 'task': None})
+          now = time.monotonic()
+          async def refresh():
+              try:
+                  value = await asyncio.wait_for(ask(), 20)
+              except Exception:
+                  value = None
+              if value and value.get('answer') == 200:
+                  st['good'], st['at'], st['fails'] = value, time.monotonic(), 0
+                  st.pop('last', None)
+              else:
+                  st['fails'] += 1
+                  st['last'] = value
+              st['task'] = None
+          if st['task'] is None and now - st['tried'] >= (ACCOUNT_EVERY if not st['fails'] else min(60 * 2 ** st['fails'], 900)):
+              st['tried'] = now
+              st['task'] = asyncio.ensure_future(refresh())
+          if st['task'] is not None:                         # an answer is on its way: wait a little for it
+              await asyncio.wait({st['task']}, timeout=6)
+          if st['good'] is not None and time.monotonic() - st['at'] < 900:
+              return dict(st['good'], age=time.monotonic() - st['at'])
+          return st.get('last')
+
+      ACCOUNTS = {}
+      ACCOUNT_EVERY = 15
+
+      STYLE = """
+      :root{--bg:#f5f6f8;--card:#fff;--ink:#16181d;--soft:#5b6270;--line:#e6e8ee;--chip:#eef0f5;--good:#12805c;--goodbg:#e7f6ef;
+      --bad:#c0362c;--badbg:#fdecea;--warn:#8a5a00;--warnbg:#fff4d6;--link:#2457d6;--shadow:0 1px 2px rgba(16,24,40,.06),0 4px 16px rgba(16,24,40,.06)}
+      @media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b22;--ink:#eceef2;--soft:#9aa3b2;--line:#272b35;--chip:#232733;
+      --good:#4ad295;--goodbg:#11281f;--bad:#ff8a80;--badbg:#2b1614;--warn:#ffcf66;--warnbg:#2a2210;--link:#8ab0ff;--shadow:0 1px 2px rgba(0,0,0,.4)}}
+      *{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+      body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+      main{max-width:860px;margin:0 auto;padding:28px 18px 48px}
+      header{display:flex;align-items:center;gap:12px;margin:0 0 18px}
+      header .dot{width:14px;height:14px;border-radius:50%;background:var(--good);box-shadow:0 0 0 5px var(--goodbg)}
+      header.down .dot{background:var(--bad);box-shadow:0 0 0 5px var(--badbg)}
+      h1{font-size:24px;letter-spacing:-.01em;margin:0;font-weight:700}
+      h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--soft);margin:0 0 12px;font-weight:700}
+      .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:14px 0;box-shadow:var(--shadow)}
+      .banner{border:0;font-size:20px;font-weight:700;display:flex;gap:12px;align-items:flex-start}
+      .banner small{display:block;font-size:16px;font-weight:500;margin-top:2px}
+      .good{background:var(--goodbg);color:var(--good)}.bad{background:var(--badbg);color:var(--bad)}.warn{background:var(--warnbg);color:var(--warn)}
+      .bad ul,.warn ul{font-size:16px;font-weight:500;margin:8px 0 0;padding-left:20px}
+      .pair{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;margin:0}
+      .pair dt{color:var(--soft)}.pair dd{margin:0;font-weight:600}
+      .provider{border-top:1px solid var(--line);padding:16px 0}.provider:first-of-type{border-top:0;padding-top:2px}.provider:last-of-type{padding-bottom:2px}
+      .provider .top{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;margin-bottom:8px}
+      .provider .name{font-size:19px;font-weight:700;margin-right:4px}
+      .pill{display:inline-block;font-size:13px;font-weight:700;padding:3px 10px;border-radius:999px;background:var(--chip);color:var(--soft);white-space:nowrap}
+      .pill.good{background:var(--goodbg);color:var(--good)}.pill.bad{background:var(--badbg);color:var(--bad)}.pill.warn{background:var(--warnbg);color:var(--warn)}
+      code{font:14.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--chip);padding:3px 8px;border-radius:7px;word-break:break-all}
+      .facts{display:flex;flex-wrap:wrap;gap:6px 22px;color:var(--soft);font-size:15.5px;margin-top:8px}.facts b{color:var(--ink);font-weight:600}
+      p{margin:10px 0 0}.note{color:var(--soft);font-size:15px}ul{margin:8px 0 0;padding-left:20px}li{margin:7px 0}
+      a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+      footer{color:var(--soft);font-size:14px;text-align:center;margin-top:22px}
+      """
+
+      def esc(text):
+          return html.escape(str(text), quote=True)
+
+      async def status_page(w, h):
+          port = h.get('x-relay-port', '')
+          host = (h.get('host', '') or 'this-machine').rsplit(':', 1)[0] if port.isdigit() else 'this-machine'
+          info = {'problems': ['The proxy could not read its own start-up notes. Look at the log: docker logs iptv-nginx'], 'providers': []}
+          if port.isdigit():
+              try:
+                  status, data = await asyncio.wait_for(get('http://127.0.0.1:%s/__status.json' % port, '', 1 << 20), 5)
+                  if status == 200:
+                      info = json.loads(data)
+              except Exception:
+                  pass
+          problems = [str(p) for p in info.get('problems') or []]
+          good = [p for p in info.get('providers') or [] if p.get('ok')]
+          skipped = [p for p in info.get('providers') or [] if not p.get('ok')]
+          working = not problems and bool(good)
+          user, password = h.get('x-relay-user', ''), h.get('x-relay-pass', '')
+          where, accounts = await asyncio.gather(where_am_i(), asyncio.gather(*[account(str(p.get('port')), user, password) for p in good]))
+
+          o = ['<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">',
+               '<meta name="color-scheme" content="light dark"><meta http-equiv="refresh" content="30"><title>IPTV proxy status</title><style>', STYLE, '</style></head><body><main>',
+               '<header class="%s"><span class="dot"></span><h1>IPTV proxy status</h1></header>' % ('' if working else 'down')]
+          if working:
+              o.append('<div class="card banner good"><div>&#9989;</div><div>The proxy is working.<small>%d provider%s loaded.</small></div></div>'
+                       % (len(good), ' is' if len(good) == 1 else 's are'))
+          else:
+              o.append('<div class="card banner bad"><div>&#10060;</div><div>The proxy is NOT working yet.<ul>')
+              o += ['<li>%s</li>' % esc(p) for p in problems]
+              if not problems and not good:
+                  o.append('<li>No provider is set up. Open your settings file (<code>.env</code>) and add the five lines for a provider. The file itself shows how.</li>')
+              o.append('</ul><small>After you fix the settings file, start the stack again and reload this page.</small></div></div>')
+          if skipped:
+              o.append('<div class="card warn"><h2 style="color:inherit">&#9888;&#65039; These providers were left out</h2><ul>')
+              o += ['<li><b>%s</b>: %s</li>' % (esc(p.get('name', '')), esc(p.get('why', ''))) for p in skipped]
+              o.append('</ul><p>Fix the line in your settings file (<code>.env</code>) and start the stack again.</p></div>')
+
+          o.append('<div class="card"><h2>Your VPN</h2>')
+          if where and where.get('ip'):
+              place = ', '.join(str(where[k]) for k in ('city', 'region', 'country') if where.get(k))
+              o.append('<dl class="pair"><dt>The internet sees you as</dt><dd>%s</dd><dt>Location</dt><dd>%s</dd>%s</dl>'
+                       % (esc(where['ip']), esc(place), '<dt>Network</dt><dd>%s</dd>' % esc(where['org']) if where.get('org') else ''))
+              o.append('<p class="note">This should be your VPN, not your home. If you see your own town and your own internet company here, stop and check your VPN settings.</p>')
+          else:
+              o.append('The proxy could not look up its public address just now. Reload this page in a minute.'
+                       '<p class="note">The VPN container still blocks all traffic when the VPN is down, so nothing leaves from your home address.</p>')
+          o.append('</div>')
+
+          o.append('<div class="card"><h2>Your providers</h2>')
+          if not good:
+              o.append('None loaded.')
+          for p, a in zip(good, accounts):
+              pill, facts = '<span class="pill warn">no answer from the provider</span>', []
+              if a and a.get('answer') == 200:
+                  state = str(a.get('status') or '')
+                  if str(a.get('auth')) == '0':
+                      pill = '<span class="pill bad">login refused by the provider</span>'
+                  elif state:
+                      pill = '<span class="pill %s">%s</span>' % ('good' if state.lower() == 'active' else 'warn', esc(state))
+                  else:
+                      pill = '<span class="pill">answered</span>'
+                  try:
+                      facts.append('Expires <b>%s</b>' % time.strftime('%Y-%m-%d', time.gmtime(int(a['exp']))) if a.get('exp') else 'No end date')
+                  except (ValueError, TypeError, OverflowError, OSError):
+                      pass
+                  if a.get('max') is not None:
+                      facts.append('In use <b>%s of %s</b>' % (esc('?' if a.get('used') is None else a['used']), esc(a['max'])))
+                  age = a.get('age', 0)
+                  facts.append('Checked <b>%s</b>' % ('just now' if age < 5 else '%d s ago' % age if age < 120 else '%d min ago' % (age // 60)))
+              elif a and a.get('answer'):
+                  pill = '<span class="pill bad">the provider answered %s</span>' % esc(a['answer'])
+              o.append('<div class="provider"><div class="top"><span class="name">%s</span>%s<span class="pill">%s</span></div>'
+                       '<div>Type this into your player: <code>http://%s:%s</code></div><div class="facts">%s</div></div>'
+                       % (esc(p.get('name', '')), pill, 'MPEG-TS' if p.get('mode') == 'ts' else 'HLS', esc(host), esc(p.get('port', '')),
+                          ''.join('<span>%s</span>' % f for f in facts)))
+          if good:
+              o.append('<p class="note">In your player, add an Xtream login with that address and the easy username and password from your settings file (<code>PLAYER_USER</code> and <code>PLAYER_PASSWORD</code>).</p>')
+          o.append('</div>')
+
+          o.append('<div class="card"><h2>The Live TV setting</h2>Each provider has one line in your settings file that says how your players watch its live channels.'
+                   '<ul><li><code>NAME_LIVE_TV=hls</code> Your players use <b>HLS</b>. Everyone on a channel shares one connection to the provider, so you can watch and record the same channel at once. A recorder that asks for MPEG-TS is given the same video as your players.</li>'
+                   '<li><code>NAME_LIVE_TV=ts</code> Your players use <b>MPEG-TS</b>. You get the provider&#39;s own stream, and everyone on a channel shares one connection to the provider. Do not open a channel as HLS while it is playing or recording as MPEG-TS: most providers allow one kind at a time per channel, and the two will cut each other off.</li></ul>'
+                   '<p class="note">Pick the one that matches the live format chosen in your players and in your playlist manager if you use one. They have to agree. If a provider only offers one of the two, use that one.</p></div>')
+
+          now = time.monotonic()
+          for k in [k for k, t in HLS_SEEN.items() if now - t > 30]:
+              del HLS_SEEN[k]
+          hls, ts = len(HLS_SEEN), sum(1 for c in CHANNELS.values() if c.key.startswith('/ts '))
+          readers = sum(len(c.readers) for c in CHANNELS.values() if c.key.startswith('/ts '))
+          recorders = sum(len(c.readers) for c in CHANNELS.values() if c.key.startswith('/hls '))
+          playing = []
+          if hls:
+              playing.append('<b>%d</b> channel%s as HLS' % (hls, '' if hls == 1 else 's'))
+          if ts:
+              playing.append('<b>%d</b> channel%s as MPEG-TS, shared by <b>%d</b> reader%s' % (ts, '' if ts == 1 else 's', readers, '' if readers == 1 else 's'))
+          if recorders:
+              playing.append('<b>%d</b> MPEG-TS reader%s being fed from HLS' % (recorders, '' if recorders == 1 else 's'))
+          o.append('<div class="card"><h2>Playing right now</h2>%s<p class="note">Live channels only. Movies, series and catch-up are not counted.</p></div>'
+                   % ('Nothing.' if not playing else '<br>'.join(playing)))
+
+          o.append('<div class="card"><h2>Still stuck?</h2>Each of the three containers keeps a log. Run the command on the machine this stack runs on.<ul>'
+                   '<li><code>docker logs iptv-nginx</code><br>The proxy. At the top it lists every provider it found, and any it left out and why. After that, one line for every request.</li>'
+                   '<li><code>docker logs iptv-relay</code><br>The Python relay. It says when a live channel is opened and closed, how long the provider took to send the first video, and anything that went wrong with a channel.</li>'
+                   '<li><code>docker logs iptv-vpn</code><br>The VPN. It says whether the tunnel is up and where it comes out.</li>'
+                   '<li>The instructions: <a href="https://github.com/mackid1993/iptv-vpn-proxy">github.com/mackid1993/iptv-vpn-proxy</a></li>'
+                   '</ul></div><footer>IPTV VPN proxy</footer></main></body></html>')
+          answer(w, 200 if working else 503, ''.join(o), 'text/html; charset=utf-8', 'Cache-Control: no-store\r\n')
+
+      async def handle(r, w):
+          rd = ch = None
+          OPEN.add(w)
+          try:
+              line = (await asyncio.wait_for(r.readline(), 10)).decode('latin-1').split()
+              h, sent, raw = {}, [], []
+              for _ in range(HEADER_LINES):
+                  x = (await asyncio.wait_for(r.readline(), 10)).decode('latin-1')
+                  if x in ('\r\n', '\n', ''):
+                      break
+                  name, _, value = x.partition(':')
+                  h[name.strip().lower()] = value.strip()
+                  raw.append((name.strip(), value.strip()))
+                  if not SKIP.match(name.strip()):       # the player's own headers, in its order, for the provider
+                      sent.append((name.strip(), re.sub(r'[^\x20-\x7e]', '', value.strip())))
+              if len(line) < 2:
+                  return
+              method, path = line[0], line[1].split('?')[0]
+              if path == '/healthz':
+                  return answer(w, 200, 'ok\n')
+              if path == '/status':
+                  return await status_page(w, h)
+              if path == '/pl':
+                  return await playlist(w, h, raw)
+              if path == '/stat':
+                  return answer(w, 200, '%d %d\n' % (len(CHANNELS), sum(len(c.readers) for c in CHANNELS.values())))
+              provider, uri = h.get('x-relay-provider', '').rstrip('/'), h.get('x-relay-uri', '')
+              if path not in ('/ts', '/hls') or provider not in PROVIDERS or not uri.startswith('/'):
+                  return answer(w, 403, 'Not a request from the proxy.\n')
+              if method == 'HEAD':                      # always answered here with 200: asking the provider would open a connection
+                  w.write(HEAD_OK)
+                  return
+              if method != 'GET':
+                  return answer(w, 400)
+              agent = re.sub(r'[^\x20-\x7e]', '', h.get('user-agent', ''))
+              target = provider + uri
+              key = channel_key(path, provider, uri)
+              ch = CHANNELS.get(key)
+              first = ch is None
+              if first:
+                  # Changing channel. A player hangs up on the old channel and asks for the new one at
+                  # almost the same moment, and the two can arrive here in either order. So, for this
+                  # provider: channels nobody is reading are let go now; if one of its channels is still
+                  # being read, a hang-up that is just behind this request is given a moment to arrive;
+                  # and the provider is given DROP_GAP to see a hang-up before this channel is asked for.
+                  LAST_OPEN[provider] = (time.monotonic(), key)
+                  mine = [c for c in CHANNELS.values() if c.provider == provider]
+                  for other in mine:
+                      other.drop_if_empty()
+                  if any(not c.done for c in mine):
+                      await asyncio.sleep(0.03)
+                      for other in mine:
+                          other.drop_if_empty()
+                  wait = LAST_DROP.get(provider, 0) + DROP_GAP - time.monotonic()
+                  if wait > 0:
+                      await asyncio.sleep(wait)
+                  if r.at_eof():                        # the player has already moved on: nothing is opened for it
+                      return
+                  for other in CHANNELS.values():       # and once more, for hang-ups that came during the waits
+                      if other.provider == provider and other.key != key:
+                          other.drop_if_empty()
+                  ch = CHANNELS.get(key)
+                  first = ch is None
+                  if first:
+                      source = ts_source(target, sent)
+                      if path == '/hls':
+                          orig, port = h.get('x-relay-orig', ''), h.get('x-relay-port', '')
+                          if not orig.startswith('/') or not port.isdigit():
+                              return answer(w, 400)
+                          q = orig.find('?')
+                          plain, query = (orig, '') if q < 0 else (orig[:q], orig[q:])
+                          plain = plain[:-3] if plain.endswith('.ts') else plain
+                          source = hls_source('http://127.0.0.1:%s/__ch%s.m3u8/__index.m3u8%s' % (port, plain, query), agent)
+                      ch = CHANNELS[key] = Channel(key, source, provider)
+              if sum(len(c.readers) for c in CHANNELS.values()) >= READERS_MAX:
+                  if first:
+                      ch.drop()
+                  ch = None
+                  return answer(w, 503, 'Too many readers at once.\n')
+              rd = ch.join(first)
+              rd.w = w
+              came, why = time.monotonic(), 'the player hung up'
+              gone = asyncio.ensure_future(r.read(1))   # completes when nginx (so the player) hangs up
+              gone.add_done_callback(lambda f: f.cancelled() or f.exception())   # a reset here is expected; keep it out of the log
+              try:
+                  wait = asyncio.ensure_future(ch.ready.wait())
+                  await asyncio.wait({wait, gone}, timeout=START_WAIT, return_when=asyncio.FIRST_COMPLETED)
+                  wait.cancel()
+                  if gone.done():
+                      return
+                  if ch.status != 200:
+                      e = ch.refusal
+                      if e is not None and 400 <= e.status < 600:   # the provider's own answer, passed on
+                          return answer(w, e.status, e.text, e.kind)
+                      return answer(w, 504 if ch.status is None else ch.status if 400 <= ch.status < 600 else 502)
+                  w.write(HEAD_OK)
+                  while True:
+                      if rd.q:
+                          data = rd.q.popleft()
+                          rd.n -= len(data)
+                          rd.given = max(0, rd.given - len(data))   # (the join's allowance is used up as the join is sent)
+                          w.write(data)
+                          drain = asyncio.ensure_future(w.drain())
+                          await asyncio.wait({drain, gone}, return_when=asyncio.FIRST_COMPLETED)
+                          if gone.done():
+                              drain.cancel()
+                              return
+                          drain.result()
+                          continue
+                      if rd.over:
+                          why = 'its channel ended'
+                          return
+                      rd.wake.clear()
+                      if rd.q or rd.over:
+                          continue
+                      wake = asyncio.ensure_future(rd.wake.wait())
+                      await asyncio.wait({wake, gone}, return_when=asyncio.FIRST_COMPLETED)
+                      wake.cancel()
+                      if gone.done():
+                          return
+              except OSError:
+                  why = 'the line to the player broke'
+                  raise
+              finally:
+                  gone.cancel()
+                  say('a reader left after %d s: %s (%d still on its channel)' % (time.monotonic() - came, why, max(0, len(ch.readers) - 1)))
+          except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+              pass
+          except Exception as e:
+              say('a request failed: ' + type(e).__name__)
+          finally:
+              OPEN.discard(w)
+              if ch is not None and rd is not None:
+                  ch.leave(rd)
+              try:
+                  w.close()
+              except Exception:
+                  pass
+
+      async def main():
+          server = await asyncio.start_server(handle, '127.0.0.1', PORT, limit=1 << 16)
+          say('ready, for %d provider%s' % (len(PROVIDERS), '' if len(PROVIDERS) == 1 else 's'))
+          stop = asyncio.Event()                        # stop when told to (this program is the container's first process)
+          for sig in (signal.SIGTERM, signal.SIGINT):
+              asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+          await stop.wait()
+          server.close()                                # stopping: let go of every stream at once
+          for ch in list(CHANNELS.values()):
+              ch.task.cancel()
+          for w in list(OPEN):
+              shut(w)
+          await asyncio.sleep(0.1)
+
+      if __name__ == '__main__':
+          asyncio.run(main())
+```
+
+</details>
 
 ## Everyday use
 
