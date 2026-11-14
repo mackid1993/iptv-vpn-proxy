@@ -21,6 +21,13 @@ on any of them.
   provider, so set it to match what is chosen in the player. There is no
   default. A provider without this line is skipped, and the status page tells
   you which line to add.
+  **Why it is needed:** it fixes a real fault. Many providers allow one
+  session per channel on an account, and an MPEG-TS request and an HLS
+  request for the same channel count as two. So when a recorder asked for
+  MPEG-TS while a player was watching that channel on HLS, each new request
+  ended the other one: the picture froze and recordings broke. The proxy can
+  keep everyone on a channel on a single provider session, but only if it
+  knows which format your players use, and it cannot work that out by itself.
 - **New status page.** Open
   `http://<the machine's address>:<any provider's port>/status` in a web
   browser. It shows what is set up, what is wrong and how to fix it, where the
