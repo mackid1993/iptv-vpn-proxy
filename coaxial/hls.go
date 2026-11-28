@@ -374,18 +374,11 @@ type session struct {
 	target     float64            // its playlist's target duration (0: not known yet)
 	seq        int64              // its playlist's MEDIA-SEQUENCE when last read (hasSeq: read at all)
 	hasSeq     bool
-	moved      float64 // when that number last moved on (see stood)
-	noted      float64 // when a playlist of it was last read (see note: a standstill nobody asked through is not one)
-	learned    float64 // a standstill this channel's playlist has shown while the provider was no further on (see loneLimit)
-	hold       bool    // a new session in its place was just as far on: no rescue again until its playlist moves
-	// rescued: opened in place of a stalled session (fromSeq, fromMoved: where that one stood, since when); its
-	// first playlist says whether the provider was any further on (see note)
-	rescued   bool
-	fromSeq   int64
-	fromMoved float64
-	paceKey   string  // the channel's key, for keeping what its first playlist teaches (see paces)
-	bridged   float64 // when the relay's own bridge (a recorder's MPEG-TS made from this HLS) last asked for it
-	refusedAt float64 // when opening the channel again in its place was last refused (see renewGap)
+	moved      float64          // when that number last moved on (see logMove)
+	noted      float64          // when a playlist of it was last read (see note: a standstill nobody asked through is not one)
+	shown      map[string]int64 // device -> the MEDIA-SEQUENCE of the playlist it was last handed (see unchangedWait)
+	bridged    float64          // when the relay's own bridge (a recorder's MPEG-TS made from this HLS) last asked for it
+	refusedAt  float64          // when opening the channel again in its place was last refused (see renewGap)
 }
 
 // renewGap: after the provider refused to open a failed session's channel again, the session's own answer is
@@ -412,15 +405,6 @@ func (s *session) note(data []byte) {
 			now := mono()
 			if s.hasSeq && n != s.seq {
 				s.logMove(now, n)
-				s.hold = false
-			}
-			if !s.hasSeq && s.rescued { // (opened in place of a stalled session: was the provider any further on?)
-				s.rescued = false
-				if n <= s.fromSeq+1 {
-					s.hold = true
-					s.learned = math.Max(s.learned, 1.3*(now-s.fromMoved))
-					keepPace(s.paceKey, s) // (kept for the channel's next tune, as on the other paths)
-				}
 			}
 			if !s.hasSeq || n != s.seq {
 				s.moved = now
@@ -495,87 +479,51 @@ func (s *session) logMove(now float64, n int64) {
 }
 
 // stoodStill: seconds a live playlist may stand still before a player that tunes the channel again is given a
-// new session whoever else is on it (never less than three of its target durations). A provider's playlist
-// stands still between its lumps, 12 s at the most seen; longer than this, a player that has given up and
-// asks for the channel afresh is not handed the same stopped playlist back. (A variable for the tests.)
+// new session (never less than three of its target durations). A provider's playlist stands still between its
+// lumps, 14 s at the most seen in healthy playback; longer than this, a player that has given up and asks for
+// the channel afresh is not handed the same stopped playlist back. (A variable for the tests.)
 var stoodStill = 15.0
 
-// stood: the session's playlist has been read and has not moved on for too long, for device who asking for
-// the channel afresh (mu held).
-//
-// A device that is alone on the session is held to the rule for a live playlist itself: a new version is due
-// no later than 1.5 target durations after the last (RFC 8216, 6.2.2), and that is when players call a
-// playlist stuck and start the channel over. Straight at the provider that new start is a new session. Seen
-// on a live system: 14 s into a tune the playlist stood still for 12.5 s, the player asked for the channel
-// again, was handed the same session and stopped for good.
-//
-// With another device or a recording on the session it is left alone for longer (stoodStill): a new session
-// numbers its pieces anew, and theirs is not given up for one device's new start.
-func (s *session) stood(now float64, who string) bool {
+// stood: the session's playlist has been read and has not moved on for too long, for a device asking for the
+// channel afresh (mu held).
+func (s *session) stood(now float64) bool {
 	if !s.hasSeq || s.moved <= 0 {
 		return false
 	}
-	limit := math.Max(stoodStill, 3*s.target)
-	if s.target > 0 && s.only(who, now) {
-		limit = s.loneLimit()
-	}
-	return now-s.moved > limit
+	return now-s.moved > math.Max(stoodStill, 3*s.target)
 }
 
-// paces: what each channel has learned of its own pace (see loneLimit), kept for its next tune. (mu held)
-var paces = map[string]float64{}
-
-// keepPace: what session s of channel key has learned, kept for the channel. (mu held)
-func keepPace(key string, s *session) {
-	if s.learned > paces[key] {
-		if len(paces) > 2000 {
-			paces = map[string]float64{}
-		}
-		paces[key] = s.learned
-	}
-}
-
-// loneLimit: how long the playlist of a session one device is alone on may stand still before it counts as
-// stuck: 1.5 target durations, at most stallCap, never under one target duration (a rescue sooner than one piece
-// fires on every piece), and never under what the channel has shown is its own normal. Some providers state a
-// shorter target than their playlists keep (stated 4 s, moving every 6.2 to 6.7 s; stated 11 s, moving every 11
-// to 13.3 s), and the stated number alone opened new sessions during normal playback, 20 times in half an hour.
-// When a new session turns out at most one piece further on than the stalled one, the standstill that set it
-// off was the provider's own pace (the next piece was just due): learned is raised 1.3 times past it, so the channel is not rescued at that pace again. (mu held)
+// unchangedWait: seconds a reload of a live playlist that would hand a device the same playlist it was handed
+// last waits before the provider is asked once more, and that answer is the one passed on.
 //
-// How far a channel may learn: up to 1.25 target durations when its pieces are stallCap or longer (a freeze 1.3
-// piece lengths into a standstill was seen on 9 s pieces); up to stallCap for pieces between; and up to 1.2
-// stallCap (12 s) for pieces of 0.6 stallCap (6 s) or shorter. A channel stating 4 to 6 s pieces stood still up
-// to 11.1 s in healthy playback, and held at 10 s it was opened again at each such pause, 8 times in 20 minutes,
-// 7 of them finding the provider no further on; a player froze only from 12.5 s on 5 s pieces.
-func (s *session) loneLimit() float64 {
-	base := math.Max(math.Min(1.5*s.target, stallCap), s.target)
-	top := stallCap
-	switch {
-	case s.target >= stallCap:
-		top = 1.25 * s.target
-	case s.target <= 0.6*stallCap:
-		top = 1.2 * stallCap
-	}
-	return math.Max(base, math.Min(s.learned, top))
-}
+// A live playlist does not move at an even pace: pieces are published in lumps, and between two lumps it can
+// stand still for several piece lengths. A player counts the reloads that bring nothing new and gives the
+// stream up after a fixed number of them (one engine: seven, asked half a piece length apart, about three piece
+// lengths in all), then opens the channel again. Answered at once, as they were, those reloads ran through
+// that count inside an ordinary pause, and the reopen that followed could end playback for good where the
+// stream had changed meanwhile (the sound going from 5.1 to stereo at a break: the player takes the reopened
+// stream for another one and stops). Nothing was wrong with any answer; nothing kept the player out of it.
+//
+// So an unchanged answer is not passed on at once. The provider is asked again after this wait: has the
+// playlist moved by then, the player has it sooner than its own next reload would have brought it; has it not,
+// the player's count runs half again as slowly, and an ordinary pause is over before it is through. No video
+// waits: a playlist that has something new for the device is always answered at once, and so is a device's
+// first look at one. A channel that has really stopped still runs the count out, a little later.
+//
+// The idea is the blocking playlist reload of the HLS specification (draft-pantos-hls-rfc8216bis, 6.2.5.2: the
+// server holds a reload until the playlist has something new), kept to one short wait because these players
+// do not ask for it. (A variable for the tests.)
+var unchangedWait = 1.0
 
-// stallCap: seconds a live playlist may stand still for a device alone on it, however long its pieces. A player
-// froze for good after 12.5 s without a move on 5 s pieces and after 11 s on 9 s pieces: 1.5 target durations
-// (13.5 s there) came too late. (A variable for the tests.)
-var stallCap = 10.0
-
-// only: device who is the one reader the session has (mu held).
-func (s *session) only(who string, now float64) bool {
-	if isLoop(who) || (s.bridged > 0 && now-s.bridged <= s.held()) {
+// unchanged: playlist text (a live one, of session s) is the one device who was handed last. (mu held)
+func (s *session) unchanged(who string, text []byte) bool {
+	m := seqTagRe.FindSubmatch(text)
+	if m == nil || bytes.Contains(text, []byte("#EXT-X-ENDLIST")) {
 		return false
 	}
-	for dev, t := range s.who {
-		if dev != who && now-t <= s.held() {
-			return false
-		}
-	}
-	return true
+	n, err := strconv.ParseInt(string(m[1]), 10, 64)
+	last, seen := s.shown[who]
+	return err == nil && seen && last == n
 }
 
 // held: how long after its last request the session still counts as a connection; idle: how long until it
@@ -1009,7 +957,6 @@ func openChannel(key, target string, h http.Header, renewFrom string, a *askLog)
 		s := &session{loc: u.String(), final: u.String(), used: mono(), opened: mono(), who: map[string]float64{}}
 		mu.Lock()
 		sessions[key] = s
-		s.learned = paces[key] // (what the channel learned of its own pace on an earlier tune)
 		mu.Unlock()
 		if renewFrom != "" {
 			a.fields(lg.Info()).Msg("a live HLS channel was opened again at the provider")
@@ -1240,19 +1187,27 @@ func playlistRequest(w http.ResponseWriter, r *http.Request, rt *route) error {
 	of := vs != nil
 	mu.Unlock()
 	// A player that asks for the channel at its own address (not for its session's playlist) has tuned it again.
-	// Straight at the provider that opens a new session. Here it was handed the remembered one whatever state
-	// that was in: a session whose playlist had stopped moving still answers 200, with the same playlist, so a
-	// player that gave up on it and tuned again got the stopped playlist back each time and never recovered.
-	// When the remembered session's playlist has stood still (see stoodStill), the channel is opened again in
-	// its place, as for a session whose reload fails. A new session's clock starts at its first read, so a
-	// channel that stays stopped is opened again at most once in that time, however often it is asked for.
+	// Straight at the provider that opens a new session. Here it is handed the remembered one, so that the
+	// devices on a channel share one session and a player that asks the channel's own address at every refresh
+	// does not open a new one each time. A session whose playlist has stopped moving still answers 200, with the
+	// same playlist, so a player that gave up on it and tuned again got the stopped playlist back each time and
+	// never recovered. When the remembered session's playlist has stood still (see stoodStill), the channel is
+	// opened again in its place, as it is straight at the provider. A new session's clock starts at its first
+	// read, so a channel that stays stopped is opened again at most once in that time, however often it is
+	// asked for.
+	//
+	// Only a new tune does this. A player that merely reloads its playlist keeps its session whatever the
+	// playlist does (for a while a reload past a limit opened a new session behind it: that brought nothing a
+	// player could use, since players follow the playlist's numbering and a channel's numbering is the same in
+	// every session, and it changed the addresses of pieces already listed, which a live playlist may not do:
+	// RFC 8216, 6.2.1).
 	if m == nil && s != nil && !back {
 		mu.Lock()
-		still, from, since := !s.hold && s.stood(mono(), who) && mono()-s.refusedAt >= renewGap, s.loc, mono()-s.moved
+		still, from, since := s.stood(mono()) && mono()-s.refusedAt >= renewGap, s.loc, mono()-s.moved
 		mu.Unlock()
 		if still {
 			ns, d, err := openChannel(key, target, h, from, asked)
-			// (refused, failed, or answered with no new session to move to: not asked again for renewGap, as on a reload)
+			// (refused, failed, or answered with no new session to move to: not asked again for renewGap)
 			if err != nil || d != nil {
 				mu.Lock()
 				s.refusedAt = mono()
@@ -1261,15 +1216,6 @@ func playlistRequest(w http.ResponseWriter, r *http.Request, rt *route) error {
 			if err == nil && d == nil && ns != nil && ns != s {
 				mu.Lock()
 				ns.what, ns.bridged = s.what, s.bridged // (still the same stream, and the same devices on it)
-				ns.learned = math.Max(s.learned, paces[key])
-				switch { // (no further on than the stalled one: the provider's own pace; learn it and hold)
-				case s.hasSeq && ns.hasSeq && ns.seq <= s.seq+1:
-					ns.hold = true
-					ns.learned = math.Max(ns.learned, 1.3*(mono()-s.moved))
-				case s.hasSeq && !ns.hasSeq: // (its first playlist is not read yet: that one decides, see note)
-					ns.rescued, ns.fromSeq, ns.fromMoved, ns.paceKey = true, s.seq, s.moved, key
-				}
-				keepPace(key, ns)
 				for dev, t := range s.who {
 					ns.who[dev] = t
 				}
@@ -1382,23 +1328,32 @@ func playlistRequest(w http.ResponseWriter, r *http.Request, rt *route) error {
 	var data []byte
 	var final string
 	var was *session // the session this one replaced, when it was opened again (for the log line below)
-	// A stalled session's own answer, kept to be passed on when opening the channel again does not work out.
-	var kept struct {
-		on     bool
-		status int
-		hd     http.Header
-		data   []byte
-		final  string
-		s      *session
-	}
 	for attempt := 1; attempt <= 2; attempt++ {
 		mu.Lock()
 		loc := s.loc
 		mu.Unlock()
 		reload := *asked
 		reload.kind, reload.routine = asked.kind+" playlist", true
-		began := mono() // (a standstill is counted up to here: a wait on a quiet connection is not one)
 		st, hdr, text, fin, err := livePlaylist(ctx, loc, h, 25, &reload)
+		// The same playlist this device was handed last: looked at once more after unchangedWait (see there).
+		// Whatever that second look brings other than a playlist, the first answer stands.
+		if err == nil && st == 200 && attempt == 1 && want.kind == "ch" && !isLoop(who) && unchangedWait > 0 {
+			mu.Lock()
+			same := s.unchanged(who, text)
+			mu.Unlock()
+			if same {
+				select {
+				case <-time.After(secs(unchangedWait)):
+				case <-ctx.Done():
+					return nil // (the player hung up)
+				}
+				if st2, hdr2, text2, fin2, err2 := livePlaylist(ctx, loc, h, 25, &reload); err2 == nil && st2 == 200 {
+					st, hdr, text, fin = st2, hdr2, text2, fin2
+				} else if ctx.Err() != nil {
+					return nil
+				}
+			}
+		}
 		if err == nil {
 			status, hd, data, final = st, hdr, text, fin
 		}
@@ -1408,14 +1363,7 @@ func playlistRequest(w http.ResponseWriter, r *http.Request, rt *route) error {
 		if attempt == 2 && ctx.Err() == nil && (err != nil || status != 200) {
 			mu.Lock()
 			s.refusedAt = mono()
-			if kept.on {
-				kept.s.refusedAt = s.refusedAt
-			}
 			mu.Unlock()
-		}
-		if kept.on && ctx.Err() == nil && (err != nil || status != 200) { // (the new session failed: the stalled one's last answer, for this reload)
-			status, hd, data, final, s, was = kept.status, kept.hd, kept.data, kept.final, kept.s, nil
-			break
 		}
 		if err != nil {
 			if attempt == 2 || ctx.Err() != nil { // (the player hung up: nothing failed at the provider)
@@ -1427,30 +1375,8 @@ func playlistRequest(w http.ResponseWriter, r *http.Request, rt *route) error {
 				status = rf.status
 			}
 		}
-		// A live playlist that has stood still past the limit for a live playlist (1.5 target durations for a
-		// device alone on it, RFC 8216 6.2.2; longer with others on it: see stood) while a player keeps
-		// reloading it is a session stuck at the provider: a new one moves on at once (seen 28 times out of 28
-		// on a live system). Players do not all start the channel over by themselves when that happens: one
-		// kept reloading the stopped playlist and then stopped asking for anything at all, frozen until its app
-		// was closed, twice in a day. So it is opened again here, and the player reloading the same address is
-		// handed the new session's playlist, as it is after it starts the channel over itself.
-		stalled := false
-		if err == nil && status == 200 && attempt == 1 && want.kind == "ch" {
-			mu.Lock()
-			if m := seqTagRe.FindSubmatch(data); m != nil && s.hasSeq && string(m[1]) == strconv.FormatInt(s.seq, 10) &&
-				!s.hold && s.stood(began, who) && mono()-s.refusedAt >= renewGap {
-				stalled = true
-				lg.Info().Str("device", who).Str("channel", channelID(uri)).Str("provider", rt.f.name).
-					Float64("stood_still_s", round1(began-s.moved)).
-					Msgf("a live HLS playlist stood still %.0f s while %s kept reloading it: opened again at the provider", began-s.moved, who)
-			}
-			mu.Unlock()
-		}
-		if (!renewOn[status] && !stalled) || attempt == 2 {
+		if !renewOn[status] || attempt == 2 {
 			break
-		}
-		if stalled {
-			kept.on, kept.status, kept.hd, kept.data, kept.final, kept.s = true, status, hd, data, final, s
 		}
 		mu.Lock()
 		refusedNow := mono()-s.refusedAt < renewGap
@@ -1461,19 +1387,13 @@ func playlistRequest(w http.ResponseWriter, r *http.Request, rt *route) error {
 			}
 			break
 		}
-		ns, d, err := openChannel(key, target, h, loc, asked) // the remembered session is gone (or stuck)
-		// Not opened again: no answer (a dropped connection, a time-out), a refusal, or, for a stalled session,
-		// an answer that is no new session to move to. Not asked again for renewGap, as on the re-tune door: a
-		// failed rescue was otherwise tried again at every reload, 17 times in 3 s.
-		if err != nil || (d != nil && (d.status >= 400 || stalled)) {
+		ns, d, err := openChannel(key, target, h, loc, asked) // the remembered session is gone
+		// Not opened again: no answer (a dropped connection, a time-out) or a refusal. Not asked again for
+		// renewGap: a failed reopen was otherwise tried again at every reload, 17 times in 3 s.
+		if err != nil || (d != nil && d.status >= 400) {
 			mu.Lock()
 			s.refusedAt = mono()
 			mu.Unlock()
-		}
-		if (err != nil || d != nil) && stalled { // (this reload gets the stalled session's last answer, not the refusal; later reloads ask
-			// that session again, which a provider whose newest session wins may already have ended)
-			status, hd, data, final = kept.status, kept.hd, kept.data, kept.final
-			break
 		}
 		if err != nil {
 			return err
@@ -1502,13 +1422,11 @@ func playlistRequest(w http.ResponseWriter, r *http.Request, rt *route) error {
 	if status == 200 {
 		s.pieces = pieces
 		s.note(data)
-		if was != nil && s != was { // (the same stream: what it has shown carries over)
-			s.learned = math.Max(was.learned, paces[key])
-			if was.hasSeq && s.hasSeq && s.seq <= was.seq+1 { // at most one piece on: the provider's own pace
-				s.hold = true
-				s.learned = math.Max(s.learned, 1.3*(mono()-was.moved))
+		if s.hasSeq && !isLoop(who) && !bytes.Contains(data, []byte("#EXT-X-ENDLIST")) {
+			if s.shown == nil {
+				s.shown = map[string]int64{}
 			}
-			keepPace(key, s)
+			s.shown[who] = s.seq // (what this device has now: see unchangedWait)
 		}
 		if was != nil && was.hasSeq && s.hasSeq { // does the new session carry on the numbering players have?
 			ev := lg.Info()

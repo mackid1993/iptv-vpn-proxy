@@ -17,7 +17,7 @@ import (
 // on a busy channel), every ask at the channel's own address opens a new session and the newest wins (an older
 // session's playlist and pieces answer 404 from then on), and any answer can be slow, refused or go quiet without
 // closing. Times are in seconds after the provider started; tests scale them where the rules they exercise can be
-// scaled (stallCap, stoodStill), and keep real seconds where they meet a fixed limit (pieceWait, renewGap).
+// scaled (unchangedWait), and keep real seconds where they meet a fixed limit (pieceWait, renewGap).
 
 type realCfg struct {
 	target float64    // the target duration its playlists state
@@ -176,13 +176,6 @@ func trickle(w http.ResponseWriter, r *http.Request, data []byte, over time.Dura
 	}
 }
 
-// scaled: the stall rescue's limits at the tests' time scale.
-func scaled(t *testing.T, cap, still float64) {
-	old, oldStill := stallCap, stoodStill
-	stallCap, stoodStill = cap, still
-	t.Cleanup(func() { stallCap, stoodStill = old, oldStill })
-}
-
 const (
 	ownAddr  = "/live/tv/easy/44.m3u8"
 	listAddr = "/__ch/live/tv/easy/44.m3u8/__index.m3u8"
@@ -300,44 +293,11 @@ func TestRealisticQuietReloadIsNotAStandstill(t *testing.T) {
 	}
 }
 
-// A player alone on a session whose playlist stopped at the provider gets a rescue (the channel opened again),
-// but the provider refuses it (403, as one does for minutes after a reopen). The player is handed the playlist it
-// had, never the refusal, and the channel is not asked for again at every reload while the refusal stands
-// (renewGap): a player straight at the provider would not reopen it at every reload either. (One tenth of the
-// time: 4 s pieces, stallCap 10 s.)
-func TestRealisticRefusedRescueKeepsThePlaylist(t *testing.T) {
-	scaled(t, 1.0, 300)
-	p := newRealProv(t, realCfg{target: 0.4, gaps: []float64{0.4}, front: func(n int, w http.ResponseWriter, r *http.Request) bool {
-		if n > 1 {
-			http.Error(w, "Forbidden", 403)
-			return true
-		}
-		return false
-	}})
-	tuneIn(t, p, "192.0.2.1")
-	for end := time.Now().Add(800 * time.Millisecond); time.Now().Before(end); time.Sleep(150 * time.Millisecond) {
-		devGet(p.base, "192.0.2.1", listAddr, 10*time.Second)
-	}
-	p.stick(1)
-	for end := time.Now().Add(3 * time.Second); time.Now().Before(end); time.Sleep(150 * time.Millisecond) {
-		st, data, err := devGet(p.base, "192.0.2.1", listAddr, 10*time.Second)
-		if err != nil || st != 200 || !bytes.Contains(data, []byte("#EXTINF")) {
-			t.Fatalf("a reload while the provider refused the rescue: status %d, %v, %q; want the playlist the player had", st, err, data)
-		}
-	}
-	if n := p.opens.Load(); n < 2 {
-		t.Fatalf("the stalled session was never rescued (%d opens)", n)
-	} else if n > 2 {
-		t.Errorf("the channel was asked for at the provider %d times in 3 s of a refused rescue; the tune and one rescue make 2 (renewGap is 8 s)", n)
-	}
-}
-
-// The whole channel stands still at the provider for 16 s (a busy channel at peak time). The player alone on it
-// is rescued once, past its limit; the new session is no further on, so the standstill was the provider's own,
-// and nothing more is opened until the playlist moves again: another reopen would end that session too and find
-// it just as far. (One tenth of the time: 4 s pieces moving every 4 s, stallCap 10 s, a reload every 0.5 s.)
-func TestRealisticWholeChannelStandstillIsRescuedOnce(t *testing.T) {
-	scaled(t, 1.0, 300)
+// The whole channel stands still at the provider for 16 s (a busy channel at peak time). Nothing is wrong with
+// the session: the channel is not opened again, for a player alone on it or anyone else. (For a while it was,
+// once past a limit: the new session was no further on, as every one on a live system was, and the old one was
+// ended for it.) (One tenth of the time: 4 s pieces moving every 4 s, a reload every 0.5 s.)
+func TestRealisticWholeChannelStandstillOpensNothing(t *testing.T) {
 	p := newRealProv(t, realCfg{target: 0.4, gaps: []float64{0.4}, still: [2]float64{1.21, 2.41}}) // (last move 1.2, next 2.8)
 	tuneIn(t, p, "192.0.2.1")
 	for time.Since(p.began).Seconds() < 3.4 {
@@ -346,16 +306,15 @@ func TestRealisticWholeChannelStandstillIsRescuedOnce(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if n := p.opens.Load(); n != 2 {
-		t.Errorf("a 16 s standstill of the whole channel opened it %d times at the provider, want 2 (the tune and one rescue)", n)
+	if n := p.opens.Load(); n != 1 {
+		t.Errorf("a 16 s standstill of the whole channel opened it %d times at the provider, want 1 (the tune)", n)
 	}
 }
 
-// Two devices watch one channel; the provider stands still 12 s on it (a busy channel). That is under the shared
-// limit (stoodStill 15 s), so neither device's reloads take the session from the other: a new session numbers
-// its pieces anew, and newest wins, so the other device's next piece would answer 404. (One tenth of the time.)
+// Two devices watch one channel; the provider stands still 12 s on it (a busy channel). Neither device's reloads
+// take the session from the other: a new session's pieces have new addresses, and newest wins, so the other
+// device's next piece would answer 404. (One tenth of the time.)
 func TestRealisticTwoDevicesRideOutABusyStandstill(t *testing.T) {
-	scaled(t, 1.0, 1.5)
 	p := newRealProv(t, realCfg{target: 0.4, gaps: []float64{0.4}, still: [2]float64{0.81, 1.61}}) // (last move 0.8, next 2.0)
 	tuneIn(t, p, "192.0.2.1")
 	tuneIn(t, p, "192.0.2.2")

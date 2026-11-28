@@ -52,6 +52,7 @@ type segmenter struct {
 	longest                      float64            // the longest piece so far: TARGETDURATION never goes down
 	players                      map[string]float64 // device -> its last request
 	waiting                      map[string]int     // device -> its playlist requests still waiting for pieces
+	shown                        map[string]int     // device -> the newest piece of the playlist it was last handed
 }
 
 var segmenters = map[string]*segmenter{} // TS channel key -> its HLS builder
@@ -175,7 +176,31 @@ wait:
 			return true, nil
 		}
 	}
+	// The same playlist this device was handed last (no piece cut since): the answer waits up to unchangedWait
+	// for the next piece, as on a provider's own HLS (see unchangedWait in hls.go). Nothing is asked of the
+	// provider for it, and a playlist with a new piece is answered at once, as before.
 	mu.Lock()
+	last, seen := sg.shown[who]
+	newest, ended, grown := -1, sg.over, sg.grew
+	if n := len(sg.segs); n > 0 {
+		newest = sg.segs[n-1].seq
+	}
+	mu.Unlock()
+	if seen && !ended && newest == last && unchangedWait > 0 {
+		select {
+		case <-grown:
+		case <-time.After(secs(unchangedWait)):
+		case <-r.Context().Done():
+			return true, nil
+		}
+	}
+	mu.Lock()
+	if n := len(sg.segs); n > 0 && !sg.over {
+		if sg.shown == nil {
+			sg.shown = map[string]int{}
+		}
+		sg.shown[who] = sg.segs[n-1].seq
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:%d\n", int(sg.target()))
 	if len(sg.segs) > 0 {
